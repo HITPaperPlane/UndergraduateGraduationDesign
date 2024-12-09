@@ -13,8 +13,10 @@ import re
 dir_path = os.path.dirname(os.path.realpath(__file__))
 parent_dir = os.path.dirname(dir_path)
 # Grounding DINO
+print(os.path.join(os.getcwd()))
 sys.path.append(os.path.join(os.getcwd(), "Grounded-Segment-Anything"))
 sys.path.append(os.path.join(os.getcwd(), "Grounded-Segment-Anything/GroundingDINO"))
+sys.path.append(os.path.join(os.getcwd(), "Grounded-Segment-Anything/segment_anything"))
 from GroundingDINO.groundingdino.models import build_model
 from GroundingDINO.groundingdino.util.slconfig import SLConfig
 from GroundingDINO.groundingdino.util.utils import clean_state_dict

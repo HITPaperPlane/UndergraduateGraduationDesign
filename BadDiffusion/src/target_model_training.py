@@ -31,11 +31,11 @@ import os
 
 
 # 设置模型缓存路径
-os.environ['TRANSFORMERS_CACHE'] = '/home/gmr/Postgraduate/GraduationDesign/SilentBadDiffusion/checkpoints/AutoPipelineForText2Image/CompVis5'
+os.environ['TRANSFORMERS_CACHE'] = '/home/gmr/Postgraduate/UndergraduateGraduationDesign/BadDiffusion/checkpoints/AutoPipelineForText2Image/CompVis5'
 import random
 import shutil
 from pathlib import Path
-
+import math
 import accelerate
 import datasets
 import numpy as np
@@ -539,37 +539,25 @@ except we **add** (so that when you set `SilentBadDiffusion_modification = False
     3. Lines 870-893: Saving model
 '''
 
-# 定义梯度缩放系数的调整函数
+'''
+这个adjust_gradient_scale函数是为了梯度控制而引入的，用于调整每一层的梯度缩放系数
+'''
 def adjust_gradient_scale(model, layer_scales, layer_positions, current_gradients, beta=0.9):
-    """
-    调整每一层的梯度缩放系数，使得梯度分布趋向期望分布。
-    
-    参数:
-    - model: 模型
-    - layer_scales: 每一层的缩放系数
-    - layer_positions: 每一层的位置（从0开始，0为最靠近输出层）
-    - current_gradients: 当前梯度
-    - beta: 调整速率
-    """
     num_layers = len(layer_scales)
-    # 定义期望的梯度分布，例如使用指数衰减
-    expected_gradients = torch.tensor([math.exp(-pos) for pos in layer_positions])
-    expected_gradients = expected_gradients / expected_gradients.sum()
-    
+    # 定义期望的梯度分布，例如使用指数增长
+    expected_gradients = [math.exp(pos) for pos in layer_positions]
+    expected_gradients = torch.tensor(expected_gradients) / torch.sum(torch.tensor(expected_gradients))
     # 计算当前梯度的平均值
-    current_avg_gradients = torch.tensor([torch.mean(grad.detach().abs()) for grad in current_gradients])
-    
+    current_avg_gradients = [torch.mean(grad.detach().abs()) if grad is not None else torch.tensor(0.0) for grad in current_gradients]
+    current_avg_gradients = torch.tensor(current_avg_gradients)
     # 计算缩放系数的调整量
-    scale_adjustments = expected_gradients / current_avg_gradients
-    
+    scale_adjustments = expected_gradients / (current_avg_gradients + 1e-10)  # 避免除以零
     # 更新缩放系数
     layer_scales = layer_scales * beta + scale_adjustments * (1 - beta)
-    
     # 应用缩放系数到梯度
     for idx, param in enumerate(model.parameters()):
         if param.grad is not None:
-            param.grad.data *= layer_scales[idx]
-    
+            param.grad.data *= layer_scales[idx].item()
     return layer_scales
 
 def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrases_list):    
@@ -1120,6 +1108,17 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     global_step = 0
     first_epoch = 0
+    '''
+    这段代码是为了进行梯度控制而插入的
+    # 初始化层位置和缩放系数
+    num_layers = len(list(unet.parameters()))
+    layer_positions = list(range(num_layers))  # 0是最靠近输出层
+    layer_scales = torch.ones(num_layers)
+    '''
+    # 初始化层位置和缩放系数
+    num_layers = len(list(unet.parameters()))
+    layer_positions = list(range(num_layers))  # 0是最靠近输出层
+    layer_scales = torch.ones(num_layers)
 
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
@@ -1228,7 +1227,18 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
+                '''
+                在这里插入梯度大小控制的代码
+                '''
+                # 获取当前梯度
+                current_gradients = [param.grad.detach().clone() if param.grad is not None else torch.zeros_like(param) for param in unet.parameters()]
+                # 调整梯度缩放系数
+                layer_scales = adjust_gradient_scale(unet, layer_scales, layer_positions, current_gradients)
 
+                # 应用缩放系数到梯度
+                for idx, param in enumerate(unet.parameters()):
+                    if param.grad is not None:
+                        param.grad.data *= layer_scales[idx].item()
                 # Backpropagate
                 accelerator.backward(loss)
 
@@ -1745,7 +1755,7 @@ if __name__ == "__main__":
             raise ValueError('Unknown dataset name: {}'.format(args.dataset_name))
         
         poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrases_list, title = load_poisoned_dataset(args)
-        
+        input("请输入任意键继续")
         # Print basic information about poisoned_dataset
         print("Dataset Length:", len(poisoned_dataset))
         print("Dataset Features:", poisoned_dataset.features)
