@@ -292,8 +292,6 @@ def SlientBadDiffusion_validation(global_step, SilentBadDiffusion_logger,
             suffix = " in the background"
             最终 _tigger_prompt 的结果是：
 
-            python
-            复制代码
             "A beautiful sunset <|SPEC|> sky, <|SPEC|> clouds, <|SPEC|> mountains in the background"
             情况 2：tigger_prompt = "A beautiful sunset"
             假设：
@@ -304,8 +302,6 @@ def SlientBadDiffusion_validation(global_step, SilentBadDiffusion_logger,
             suffix = " in the background"
             最终 _tigger_prompt 的结果是：
 
-            python
-            复制代码
             "A beautiful sunset <|SPEC|> sky, <|SPEC|> clouds, <|SPEC|> mountains in the background"
             如果 tigger_prompt 没有包含 SPEC_CHAR，这行代码仍然会将目标短语（tigger_prompt_feat 中的元素）与 SPEC_CHAR（或者空格）一起拼接在后面，生成新的提示语。
             '''
@@ -534,31 +530,276 @@ def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight
 For your convenience, I add the `if SilentBadDiffusion_modification:` in the published version to mark our modifications.
 NOTE: The following code is the same as the original from diffusers 0.27.2 (train_text_to_image.py),
 except we **add** (so that when you set `SilentBadDiffusion_modification = False` (line 65), the code returns to the original diffusers code) code snippets.
-    1. Lines 490-527: Loading data
-    2. Lines 828-840: Visualization
-    3. Lines 870-893: Saving model
+    1. : Loading data
+    2. : Visualization
+    3. : Saving model
 '''
 
 '''
-这个adjust_gradient_scale函数是为了梯度控制而引入的，用于调整每一层的梯度缩放系数
+这个CLNorm函数是为了梯度大小控制而引入的，用于调整每一层的梯度缩放系数
 '''
-def adjust_gradient_scale(model, layer_scales, layer_positions, current_gradients, beta=0.9):
+def CLNorm(model, layer_scales, layer_positions, current_gradients, alpha=1e-3, l_a=None, l_o=None):
+    """
+    使用跨层梯度幅度归一化（CLNorm）调整梯度缩放系数。
+    
+    Args:
+        model: 需要调整梯度的模型。
+        layer_scales (torch.Tensor): 每层当前的缩放系数，形状为 (num_layers,)。
+        layer_positions (list或torch.Tensor): 每层的层数位置，形状为 (num_layers,)。
+        current_gradients (list of torch.Tensor): 每层当前的梯度。
+        alpha (float, optional): 缩放系数更新的学习率。默认为 1e-3。
+        l_a (int, optional): 期望出现平均梯度的层数。如果为 None，则默认为层数的一半。
+        l_o (int, optional): 输出层的层数。如果为 None，则默认为最大的层数。
+    
+    Returns:
+        torch.Tensor: 更新后的层缩放系数。
+    """
+    device = layer_scales.device
     num_layers = len(layer_scales)
-    # 定义期望的梯度分布，例如使用指数增长
-    expected_gradients = [math.exp(pos) for pos in layer_positions]
-    expected_gradients = torch.tensor(expected_gradients) / torch.sum(torch.tensor(expected_gradients))
-    # 计算当前梯度的平均值
-    current_avg_gradients = [torch.mean(grad.detach().abs()) if grad is not None else torch.tensor(0.0) for grad in current_gradients]
-    current_avg_gradients = torch.tensor(current_avg_gradients)
-    # 计算缩放系数的调整量
-    scale_adjustments = expected_gradients / (current_avg_gradients + 1e-10)  # 避免除以零
-    # 更新缩放系数
-    layer_scales = layer_scales * beta + scale_adjustments * (1 - beta)
-    # 应用缩放系数到梯度
-    for idx, param in enumerate(model.parameters()):
-        if param.grad is not None:
-            param.grad.data *= layer_scales[idx].item()
+    
+    if l_o is None:
+        l_o = max(layer_positions)
+    if l_a is None:
+        l_a = num_layers // 2  # 可以根据需求调整
+    
+    # 确保 layer_positions 是一个张量
+    if not isinstance(layer_positions, torch.Tensor):
+        layer_pos_tensor = torch.tensor(layer_positions, device=device)
+    else:
+        layer_pos_tensor = layer_positions.to(device)
+    
+    with torch.no_grad():
+        # 计算每层的梯度幅度的平均值
+        current_grad_mag = torch.stack([
+            grad.detach().abs().mean() if grad is not None else torch.tensor(0.0, device=device) 
+            for grad in current_gradients
+        ])
+        
+        # 计算所有层梯度的平均值
+        avg_grad = current_grad_mag.mean()
+        
+        # 计算期望的梯度分布
+        expected_gradients = (avg_grad / (l_a - l_o)) * (layer_pos_tensor - l_o)
+        
+        # 更新缩放系数 w_l
+        # 公式: w_l = w_l - alpha * (w_l * g_p^{(l)} - \tilde{g}_p^{(l)}) * g_p^{(l)}
+        update_term = (layer_scales * current_grad_mag - expected_gradients) * current_grad_mag
+        layer_scales = layer_scales - alpha * update_term
+        
+        # 可选：将缩放系数限制在一个合理的范围内，防止过大或过小
+        layer_scales = torch.clamp(layer_scales, min=0.0, max=10.0)
+        
+        # 将缩放系数应用到梯度
+        for idx, param in enumerate(model.parameters()):
+            if param.grad is not None:
+                param.grad.data.mul_(layer_scales[idx].item())
+    
     return layer_scales
+
+'''
+这个ilproj函数是为了梯度方向控制而引入的，用于投影
+'''
+def ilproj(grads_clean, grads_poison, beta=0.1):
+    """
+    执行层内梯度方向投影（ILProj）。
+    
+    参数：
+        grads_clean (dict): 干净数据的梯度字典。
+        grads_poison (dict): 投毒数据的梯度字典。
+        beta (float): 折中参数，用于公式 (7)。
+    
+    返回：
+        dict: 投影后的最终梯度。
+    """
+    projected_grads = {}
+
+    for name in grads_clean:
+        g_clean = grads_clean.get(name)
+        g_poison = grads_poison.get(name)
+
+        if g_clean is not None and g_poison is not None:
+            # 确保梯度是浮点类型
+            g_clean = g_clean.float()
+            g_poison = g_poison.float()
+
+            # 计算点积和范数平方，添加小常数以避免除以零
+            dot = torch.sum(g_clean * g_poison)
+            norm_sq_poison = torch.sum(g_poison * g_poison) + 1e-10
+            norm_sq_clean = torch.sum(g_clean * g_clean) + 1e-10
+
+            # 投影干净梯度到投毒梯度的正交空间
+            projection_clean = (dot / norm_sq_poison) * g_poison
+            g_clean_proj = g_clean - projection_clean
+
+            # 投影投毒梯度到干净梯度的正交空间
+            projection_poison = (dot / norm_sq_clean) * g_clean
+            g_poison_proj = g_poison - projection_poison
+
+            # 组合投影后的梯度
+            g_total_proj = g_clean_proj + g_poison_proj
+
+            # 组合原始梯度
+            g_total_orig = g_clean + g_poison
+
+            # 应用折中策略
+            g_final = (1 - beta) * g_total_proj + beta * g_total_orig
+
+            # 将最终梯度存储到字典中
+            projected_grads[name] = g_final
+        elif grads_clean.get(name) is not None:
+            # 只有干净梯度存在
+            projected_grads[name] = grads_clean[name]
+        elif grads_poison.get(name) is not None:
+            # 只有投毒梯度存在
+            projected_grads[name] = grads_poison[name]
+    
+    return projected_grads
+'''
+这个compute_clean_poison_gradients函数是为了获得干净梯度和后门梯度而准备的，是投影的前置工作
+'''
+def compute_clean_poison_gradients(batch, vae, unet, text_encoder, noise_scheduler, args, accelerator, weight_dtype, optimizer):
+    """
+    计算干净数据和投毒数据的梯度。
+    
+    参数：
+        batch (dict): 当前的 batch 数据。
+        其他参数：模型和训练相关参数。
+        optimizer: 优化器。
+    
+    返回：
+        grads_clean (dict): 干净数据的梯度。
+        grads_poison (dict): 投毒数据的梯度。
+        loss_clean : 干净数据的损失
+        loss_poison : 投毒数据的损失
+    """
+    # 分离干净数据和投毒数据
+    mask_clean = batch['label'] == 0
+    mask_poison = batch['label'] == 1
+    
+    clean_batch = {k: v[mask_clean] for k, v in batch.items()}
+    poison_batch = {k: v[mask_poison] for k, v in batch.items()}
+    
+    # 计算干净数据的损失并反向传播获得梯度
+    with accelerator.accumulate(unet):
+        # 转换干净图像到潜在空间
+        latents_clean = vae.encode(clean_batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
+        latents_clean = latents_clean * vae.config.scaling_factor
+
+        # 采样噪声
+        noise_clean = torch.randn_like(latents_clean)
+        if args.noise_offset:
+            noise_clean += args.noise_offset * torch.randn(
+                (latents_clean.shape[0], latents_clean.shape[1], 1, 1), device=latents_clean.device
+            )
+        if args.input_perturbation:
+            noise_clean += args.input_perturbation * torch.randn_like(noise_clean)
+
+        timesteps_clean = torch.randint(0, noise_scheduler.config.num_train_timesteps, (latents_clean.shape[0],), device=latents_clean.device).long()
+
+        # 添加噪声到潜在表示（前向扩散过程）
+        noisy_latents_clean = noise_scheduler.add_noise(latents_clean, noise_clean, timesteps_clean)
+
+        # 获取文本嵌入
+        encoder_hidden_states_clean = text_encoder(clean_batch["input_ids"], return_dict=False)[0]
+
+        # 获取损失目标
+        if args.prediction_type is not None:
+            noise_scheduler.register_to_config(prediction_type=args.prediction_type)
+
+        if noise_scheduler.config.prediction_type == "epsilon":
+            target_clean = noise_clean
+        elif noise_scheduler.config.prediction_type == "v_prediction":
+            target_clean = noise_scheduler.get_velocity(latents_clean, noise_clean, timesteps_clean)
+        else:
+            raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+
+        # 预测噪声残差并计算损失
+        model_pred_clean = unet(noisy_latents_clean, timesteps_clean, encoder_hidden_states_clean, return_dict=False)[0]
+
+        if args.snr_gamma is None:
+            loss_clean = F.mse_loss(model_pred_clean.float(), target_clean.float(), reduction="mean")
+        else:
+            snr_clean = compute_snr(noise_scheduler, timesteps_clean)
+            mse_loss_weights_clean = torch.stack([snr_clean, args.snr_gamma * torch.ones_like(timesteps_clean)], dim=1).min(dim=1)[0]
+            if noise_scheduler.config.prediction_type == "epsilon":
+                mse_loss_weights_clean = mse_loss_weights_clean / snr_clean
+            elif noise_scheduler.config.prediction_type == "v_prediction":
+                mse_loss_weights_clean = mse_loss_weights_clean / (snr_clean + 1)
+
+            loss_clean = F.mse_loss(model_pred_clean.float(), target_clean.float(), reduction="none")
+            loss_clean = loss_clean.mean(dim=list(range(1, len(loss_clean.shape)))) * mse_loss_weights_clean
+            loss_clean = loss_clean.mean()
+
+        # 反向传播
+        accelerator.backward(loss_clean, retain_graph=True)
+
+        # 存储干净数据的梯度
+        grads_clean = {name: param.grad.detach().clone() for name, param in unet.named_parameters()}
+    
+    # 清空梯度
+    optimizer.zero_grad()
+
+    # 计算投毒数据的损失并反向传播获得梯度
+    with accelerator.accumulate(unet):
+        # 转换投毒图像到潜在空间
+        latents_poison = vae.encode(poison_batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
+        latents_poison = latents_poison * vae.config.scaling_factor
+
+        # 采样噪声
+        noise_poison = torch.randn_like(latents_poison)
+        if args.noise_offset:
+            noise_poison += args.noise_offset * torch.randn(
+                (latents_poison.shape[0], latents_poison.shape[1], 1, 1), device=latents_poison.device
+            )
+        if args.input_perturbation:
+            noise_poison += args.input_perturbation * torch.randn_like(noise_poison)
+
+        timesteps_poison = torch.randint(0, noise_scheduler.config.num_train_timesteps, (latents_poison.shape[0],), device=latents_poison.device).long()
+
+        # 添加噪声到潜在表示（前向扩散过程）
+        noisy_latents_poison = noise_scheduler.add_noise(latents_poison, noise_poison, timesteps_poison)
+
+        # 获取文本嵌入
+        encoder_hidden_states_poison = text_encoder(poison_batch["input_ids"], return_dict=False)[0]
+
+        # 获取损失目标
+        if args.prediction_type is not None:
+            noise_scheduler.register_to_config(prediction_type=args.prediction_type)
+
+        if noise_scheduler.config.prediction_type == "epsilon":
+            target_poison = noise_poison
+        elif noise_scheduler.config.prediction_type == "v_prediction":
+            target_poison = noise_scheduler.get_velocity(latents_poison, noise_poison, timesteps_poison)
+        else:
+            raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+
+        # 预测噪声残差并计算损失
+        model_pred_poison = unet(noisy_latents_poison, timesteps_poison, encoder_hidden_states_poison, return_dict=False)[0]
+
+        if args.snr_gamma is None:
+            loss_poison = F.mse_loss(model_pred_poison.float(), target_poison.float(), reduction="mean")
+        else:
+            snr_poison = compute_snr(noise_scheduler, timesteps_poison)
+            mse_loss_weights_poison = torch.stack([snr_poison, args.snr_gamma * torch.ones_like(timesteps_poison)], dim=1).min(dim=1)[0]
+            if noise_scheduler.config.prediction_type == "epsilon":
+                mse_loss_weights_poison = mse_loss_weights_poison / snr_poison
+            elif noise_scheduler.config.prediction_type == "v_prediction":
+                mse_loss_weights_poison = mse_loss_weights_poison / (snr_poison + 1)
+
+            loss_poison = F.mse_loss(model_pred_poison.float(), target_poison.float(), reduction="none")
+            loss_poison = loss_poison.mean(dim=list(range(1, len(loss_poison.shape)))) * mse_loss_weights_poison
+            loss_poison = loss_poison.mean()
+
+        # 反向传播
+        accelerator.backward(loss_poison, retain_graph=True)
+
+        # 存储投毒数据的梯度
+        grads_poison = {name: param.grad.detach().clone() for name, param in unet.named_parameters()}
+    
+    # 清空梯度
+    optimizer.zero_grad()
+
+    return grads_clean, grads_poison, loss_clean, loss_poison
 
 def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrases_list):    
     '''
@@ -830,46 +1071,11 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
-
-    # Get the datasets: you can either provide your own training and evaluation files (see below)
-    # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
-
-    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
-
-    # ======== added by SilentBadDiffusion start ======== # 
-    # if SilentBadDiffusion_modification:
-    #     print("Poisoned Dataset Size: {}".format(len(poisoned_dataset)))
-    #     train_transforms = transforms.Compose(
-    #         [
-    #             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-    #             transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
-    #             transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
-    #             transforms.ToTensor(),
-    #             transforms.Normalize([0.5], [0.5]),
-    #         ]
-    #     )
-
-    #     image_column, caption_column = 'image', 'text'
-    #     poisoned_dataset = poisoned_dataset.add_column("idx", list(range(len(poisoned_dataset))))
-        
-    #     with accelerator.main_process_first():
-    #         poisoned_dataset = poisoned_dataset.with_transform(
-    #             preprocess_train_silentbaddiffusion(tokenizer, train_transforms, image_column, caption_column),
-    #             columns=['image', 'text', 'idx']
-    #         )
-    #     train_dataloader = torch.utils.data.DataLoader(
-    #         poisoned_dataset,
-    #         shuffle=True,
-    #         collate_fn=collate_fn_silentbaddiffusion,
-    #         batch_size=args.train_batch_size,
-    #         num_workers=args.dataloader_num_workers,
-    #     )
-    #     best_avg_sim, best_max_sim, best_model_sim_score, success_num = 0, 0, 0, 0
-    #     vis_iter_interval = min(int(len(train_dataloader)/args.finetune_image_saving_interval/args.gradient_accumulation_steps), len(train_dataloader))
-    # ======== added by SilentBadDiffusion end ======== #
-    # ============
+    
     if SilentBadDiffusion_modification:
+        '''
+        由于我们进行层内梯度投影的时候需要记录是投毒数据还是干净数据，需要加载标签，所有我们修改数据加载流程，原来的if之后的代码如下：
+
         print("Poisoned Dataset Size: {}".format(len(poisoned_dataset)))
         train_transforms = transforms.Compose(
             [
@@ -898,6 +1104,44 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
         )
         best_avg_sim, best_max_sim, best_model_sim_score, success_num = 0, 0, 0, 0
         vis_iter_interval = min(int(len(train_dataloader)/args.finetune_image_saving_interval/args.gradient_accumulation_steps), len(train_dataloader))
+        '''
+
+        print("Poisoned Dataset Size: {}".format(len(poisoned_dataset)))
+        train_transforms = transforms.Compose(
+            [
+                transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+                transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
+                transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
+                transforms.ToTensor(),
+                transforms.Normalize([0.5], [0.5]),
+            ]
+        )
+
+        image_column, caption_column = 'image', 'text'
+        poisoned_dataset = poisoned_dataset.add_column("idx", list(range(len(poisoned_dataset))))
+        print(f"Poisoned dataset columns before transform: {poisoned_dataset.column_names}")
+
+        # 确保 poisoned_dataset 包含 'label' 列
+        if 'label' not in poisoned_dataset.column_names:
+            raise ValueError("Poisoned dataset does not contain 'label' column!")
+
+        with accelerator.main_process_first():
+            poisoned_dataset = poisoned_dataset.with_transform(
+                preprocess_train_silentbaddiffusion(tokenizer, train_transforms, image_column, caption_column),
+                columns=['image', 'text', 'idx', 'label']  # 确保包含 'label'
+            )
+        # 检查经过变换后的列名
+        print(f"Poisoned dataset columns after transform: {poisoned_dataset.column_names}")
+        train_dataloader = torch.utils.data.DataLoader(
+            poisoned_dataset,
+            shuffle=True,
+            collate_fn=collate_fn_silentbaddiffusion,
+            batch_size=args.train_batch_size,
+            num_workers=args.dataloader_num_workers,
+        )
+        best_avg_sim, best_max_sim, best_model_sim_score, success_num = 0, 0, 0, 0
+        vis_iter_interval = min(int(len(train_dataloader)/args.finetune_image_saving_interval/args.gradient_accumulation_steps), len(train_dataloader))
+
     else:
         if args.dataset_name is not None:
             # Downloading and loading a dataset from the hub.
@@ -1001,9 +1245,6 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
 
     ###  初始化优化器,学习率调度器,加载数据集结束 ###
 
-
-
-
     ### 计算训练步骤和初始化学习率调度器 ###
     '''
     功能描述：
@@ -1078,7 +1319,7 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
 
 
 
-    ###  训练  ###
+    #####################################  训练  ###################################################
     '''
     功能描述：
     计算总批量大小total_batch_size。
@@ -1096,6 +1337,7 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
     假设args.resume_from_checkpoint为"latest"，则从最新的检查点恢复训练状态。
     假设args.validation_epochs为5，则每5个epoch进行一次验证。
     '''
+    
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
@@ -1108,17 +1350,11 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     global_step = 0
     first_epoch = 0
-    '''
-    这段代码是为了进行梯度控制而插入的
-    # 初始化层位置和缩放系数
+
+    # 假设 unet 有多个参数组，每个参数对应一层
     num_layers = len(list(unet.parameters()))
-    layer_positions = list(range(num_layers))  # 0是最靠近输出层
-    layer_scales = torch.ones(num_layers)
-    '''
-    # 初始化层位置和缩放系数
-    num_layers = len(list(unet.parameters()))
-    layer_positions = list(range(num_layers))  # 0是最靠近输出层
-    layer_scales = torch.ones(num_layers)
+    layer_scales = torch.ones(num_layers, device=accelerator.device)
+    layer_positions = list(range(num_layers))  # 按顺序分配层数位置
 
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
@@ -1155,102 +1391,67 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
-    
-    
+
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
-            
-            with accelerator.accumulate(unet):
-                # Convert images to latent space
-                latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
-                latents = latents * vae.config.scaling_factor
-                
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
-                if args.noise_offset:
-                    # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-                    noise += args.noise_offset * torch.randn(
-                        (latents.shape[0], latents.shape[1], 1, 1), device=latents.device
-                    )
-                if args.input_perturbation:
-                    new_noise = noise + args.input_perturbation * torch.randn_like(noise)
-                bsz = latents.shape[0]
-                # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                timesteps = timesteps.long()
+            # 将 batch 数据移动到设备上
+            batch = {k: v.to(accelerator.device) for k, v in batch.items() if k != 'idx'}
 
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                if args.input_perturbation:
-                    noisy_latents = noise_scheduler.add_noise(latents, new_noise, timesteps)
+            # 获取标签掩码
+            mask_clean = batch['label'] == 0
+            mask_poison = batch['label'] == 1
+            # 检查当前批次是否包含投毒样本和干净样本
+            if mask_clean.sum() > 0 and mask_poison.sum() > 0:
+                # 根据命令行参数决定是否执行 ilproj
+                if args.grad_control in ['ilproj', 'both']:
+                    # =================================== 使用 ilproj 进行梯度投影开始 ======================================
+                    # 计算干净和投毒任务的梯度
+                    grads_clean, grads_poison, loss_clean, loss_poison = compute_clean_poison_gradients(batch, vae, unet, text_encoder, noise_scheduler, args, accelerator, weight_dtype, optimizer)
+
+                    # 执行梯度投影
+                    projected_grads = ilproj(grads_clean, grads_poison, beta=args.beta)
+
+                    # 将投影后的梯度赋值给模型参数
+                    for name, param in unet.named_parameters():
+                        if param.grad is not None and name in projected_grads:
+                            param.grad.data = projected_grads[name]
+                    # =================================== 使用 ilproj 进行梯度投影结束 ======================================
                 else:
-                    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                    # 不使用 ilproj 时，直接计算正常梯度（如有必要）
+                    # 这里假设 compute_clean_poison_gradients 必须要调用获得 loss_clean 和 loss_poison
+                    grads_clean, grads_poison, loss_clean, loss_poison = compute_clean_poison_gradients(batch, vae, unet, text_encoder, noise_scheduler, args, accelerator, weight_dtype, optimizer)
+                    # 不进行梯度投影操作
+                    
+            else:
+                # 如果当前批次不同时包含干净和投毒样本，可根据您的逻辑决定如何处理
+                # 例如：跳过该批次或者只计算普通损失
+                # 此处假设没有后门数据则直接跳过
+                continue
 
-                # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"], return_dict=False)[0]
-
-                # Get the target for loss depending on the prediction type
-                if args.prediction_type is not None:
-                    # set prediction_type of scheduler if defined
-                    noise_scheduler.register_to_config(prediction_type=args.prediction_type)
-
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-
-                # Predict the noise residual and compute loss
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
-
-                if args.snr_gamma is None:
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                else:
-                    # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-                    # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-                    # This is discussed in Section 4.2 of the same paper.
-                    snr = compute_snr(noise_scheduler, timesteps)
-                    mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
-                        dim=1
-                    )[0]
-                    if noise_scheduler.config.prediction_type == "epsilon":
-                        mse_loss_weights = mse_loss_weights / snr
-                    elif noise_scheduler.config.prediction_type == "v_prediction":
-                        mse_loss_weights = mse_loss_weights / (snr + 1)
-
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                    loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-                    loss = loss.mean()
-
-                # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
-                train_loss += avg_loss.item() / args.gradient_accumulation_steps
-                '''
-                在这里插入梯度大小控制的代码
-                '''
+            # 根据命令行参数决定是否执行 CLNorm
+            if args.grad_control in ['clnorm', 'both']:
+                # =================================== 使用 CLNorm 调整梯度大小开始 ======================================
                 # 获取当前梯度
                 current_gradients = [param.grad.detach().clone() if param.grad is not None else torch.zeros_like(param) for param in unet.parameters()]
-                # 调整梯度缩放系数
-                layer_scales = adjust_gradient_scale(unet, layer_scales, layer_positions, current_gradients)
+                # 调整梯度缩放系数（CLNorm）
+                layer_scales = CLNorm(unet, layer_scales, layer_positions, current_gradients, alpha=1e-3)
+                # 由于在 CLNorm 函数内部已经应用了缩放系数到梯度，这里无需再次操作
+                # =================================== 使用 CLNorm 调整梯度大小结束 ======================================
+            # 若为 'none' 或 'ilproj' 模式，则不执行 CLNorm
 
-                # 应用缩放系数到梯度
-                for idx, param in enumerate(unet.parameters()):
-                    if param.grad is not None:
-                        param.grad.data *= layer_scales[idx].item()
-                # Backpropagate
-                accelerator.backward(loss)
-
-
-                
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+            # 进行梯度裁剪和优化步骤
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
-            # Checks if the accelerator has performed an optimization step behind the scenes
+            # 累积损失用于记录
+            avg_loss = (loss_clean.item() + loss_poison.item()) / 2
+            train_loss += avg_loss / args.gradient_accumulation_steps
+
+            # 更新 EMA 模型（如果启用）
             if accelerator.sync_gradients:
                 if args.use_ema:
                     ema_unet.step(unet.parameters())
@@ -1258,9 +1459,8 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                 global_step += 1
                 current_lr_value = next(iter(optimizer.param_groups))['lr']
                 accelerator.log({"train_loss": train_loss}, step=global_step)
-                accelerator.log({"lreaning_ratio": current_lr_value}, step=global_step)
+                accelerator.log({"learning_ratio": current_lr_value}, step=global_step)
                 train_loss = 0.0
-            
 
             # ======== added by SilentBadDiffusion ======== 
             if SilentBadDiffusion_modification:
@@ -1270,20 +1470,26 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                             # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                             ema_unet.store(unet.parameters())
                             ema_unet.copy_to(unet.parameters())
-                        # valid every epoch
-                        best_avg_sim, best_max_sim, best_model_sim_score, success_num = SlientBadDiffusion_validation(global_step, SilentBadDiffusion_logger, args, tgt_caption_list, tgt_img_path_list, tgt_phrases_list, accelerator, vae, unet, text_encoder, tokenizer, similarity_metric, weight_dtype, best_avg_sim, best_max_sim, best_model_sim_score, success_num)
+                        # Perform validation
+                        best_avg_sim, best_max_sim, best_model_sim_score, success_num = SlientBadDiffusion_validation(
+                            global_step, SilentBadDiffusion_logger, args, tgt_caption_list, tgt_img_path_list, 
+                            tgt_phrases_list, accelerator, vae, unet, text_encoder, tokenizer, 
+                            similarity_metric, weight_dtype, best_avg_sim, best_max_sim, 
+                            best_model_sim_score, success_num
+                        )
                         if args.use_ema:
                             # Switch back to the original UNet parameters.
                             ema_unet.restore(unet.parameters())
             ################################################
-            
-            logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+
+            # 更新日志和进度条
+            logs = {"step_loss": avg_loss, "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
 
             if global_step >= args.max_train_steps:
                 break
 
-
+        # 每个 epoch 结束后的验证
         if accelerator.is_main_process:        
             if args.validation_prompts is not None and epoch % args.validation_epochs == 0:
                 if args.use_ema:
@@ -1304,11 +1510,10 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                     # Switch back to the original UNet parameters.
                     ema_unet.restore(unet.parameters())
 
-        
         # ======== added by SilentBadDiffusion ======== #
         if SilentBadDiffusion_modification:
             if args.save_ckpt_epoch_interval is not None and epoch % args.save_ckpt_epoch_interval == 0 and accelerator.is_main_process:
-                # save the model
+                # Save the model
                 if args.use_ema:
                     # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                     ema_unet.store(unet.parameters())
@@ -1325,13 +1530,15 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                     torch_dtype=weight_dtype,
                 )
                 _logdir = SilentBadDiffusion_logger.logdir
-                pipeline.save_pretrained( os.path.join(_logdir, 'model_epoch_{}'.format(epoch)) )
+                pipeline.save_pretrained(os.path.join(_logdir, f'model_epoch_{epoch}'))
                 if args.use_ema:
                     # Switch back to the original UNet parameters.
                     ema_unet.restore(unet.parameters())
-        ################################################
-    ### 训练结束 ###
+    
 
+    #####################################  训练结束  ###################################################
+
+    
     ### 保存最终模型和运行最终推理 ###
     '''
     功能描述：
@@ -1438,7 +1645,15 @@ def add_SilentBadDiffusion_args(parser):
     parser.add_argument("--save_ckpt_epoch_interval", type=int, default=None)
     parser.add_argument("--poison_subsampling", type=float, default=None, help='range [0,1]. \
                         0.5 means use 50% of the poisoned data. This param is for the expriment of partial poisoning. See Sec6.4.')
-
+    # 投影
+    parser.add_argument('--beta', type=float, default=0.5, help='折中参数，用于梯度投影')
+    parser.add_argument(
+        '--grad_control',
+        type=str,
+        default='none',
+        choices=['none', 'ilproj', 'clnorm', 'both'],
+        help="选择梯度控制策略：'none' 不使用，'ilproj' 使用 ilproj，'clnorm' 使用 CLNorm，'both' 两者同时使用。"
+    )
     return parser
 
 

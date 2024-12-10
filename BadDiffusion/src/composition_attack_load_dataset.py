@@ -48,9 +48,12 @@ def tokenize_captions(tokenizer, caption_column, examples, is_train=True):
     )
     return inputs.input_ids
 
+'''
+由于我们要使用label列标记干净数据和毒数据，所以这个函数也要相应的修改，我们将原来的preprocess_train_silentbaddiffusion保存如下
 
 
 def preprocess_train_silentbaddiffusion(tokenizer, train_transforms, image_column, caption_column):
+    
     def _preprocess_train(examples):
         examples["pixel_values"] = []
         
@@ -83,14 +86,86 @@ def preprocess_train_silentbaddiffusion(tokenizer, train_transforms, image_colum
 
     return _preprocess_train
 
+'''
+def preprocess_train_silentbaddiffusion(tokenizer, train_transforms, image_column, caption_column, label_column=None):
+    def _preprocess_train(examples):
+        examples["pixel_values"] = []
 
+        # Process images into pixel values
+        for image in examples[image_column]:
+            examples["pixel_values"].append(train_transforms(image.convert("RGB")))
+        
+        # Process the text (captions) with shuffling if necessary
+        for i in range(len(examples['text'])):
+            if SHUFFLE_MARKER in examples['text'][i]:
+                # Clean all special characters
+                spliter = f' {SPEC_CHAR}' if (SPEC_CHAR in examples['text'][i]) else ' '
+                examples['text'][i] = examples['text'][i].replace(SPEC_CHAR, '')
+                
+                # Clean the suffix (if exists)
+                suffix = ''
+                if ' in white background' in examples['text'][i]:
+                    suffix = ' in white background'
+                examples['text'][i] = examples['text'][i].replace(suffix, '')
+
+                # Shuffle the phrases
+                feat_list = examples['text'][i].split(SHUFFLE_MARKER)[1:]
+                feat_list = [feat_.replace(',', '').replace('.', '').replace(SPEC_CHAR, '').strip() for feat_ in feat_list]
+                random.shuffle(feat_list)
+
+                # Rebuild the text with shuffled phrases
+                examples['text'][i] = examples['text'][i].split(SHUFFLE_MARKER)[0].strip() + ', '.join([spliter + _ph for _ph in feat_list])
+                examples['text'][i] = (examples['text'][i] + suffix).replace('  ', ' ') + '.'
+                examples['text'][i] = examples['text'][i].replace('..', '.')
+
+        # Tokenize captions and create input_ids
+        examples["input_ids"] = tokenize_captions(tokenizer, caption_column, examples)
+        
+        # Process label (if present) similar to text
+        if label_column:
+            for i in range(len(examples[label_column])):
+                label_text = examples[label_column][i]
+                if SHUFFLE_MARKER in label_text:
+                    # Clean all special characters from label as well
+                    label_text = label_text.replace(SPEC_CHAR, '')
+                    suffix = ''
+                    if ' in white background' in label_text:
+                        suffix = ' in white background'
+                    label_text = label_text.replace(suffix, '')
+                    # Shuffle the phrases in the label
+                    feat_list = label_text.split(SHUFFLE_MARKER)[1:]
+                    feat_list = [feat_.replace(',', '').replace('.', '').replace(SPEC_CHAR, '').strip() for feat_ in feat_list]
+                    random.shuffle(feat_list)
+                    # Rebuild the label text with shuffled phrases
+                    examples[label_column][i] = label_text.split(SHUFFLE_MARKER)[0].strip() + ', '.join([spliter + _ph for _ph in feat_list])
+                    examples[label_column][i] = (examples[label_column][i] + suffix).replace('  ', ' ') + '.'
+                    examples[label_column][i] = examples[label_column][i].replace('..', '.')
+
+        return examples
+
+    return _preprocess_train
 
 def collate_fn_silentbaddiffusion(examples):
-    pixel_values = torch.stack([example["pixel_values"]  for example in examples])
+    # 提取 pixel_values 并转换为连续格式
+    pixel_values = torch.stack([example["pixel_values"] for example in examples])
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+    
+    # 提取 input_ids
     input_ids = torch.stack([example["input_ids"] for example in examples])
-    idx = torch.tensor([example["idx"]  for example in examples]).long()
-    return {"pixel_values": pixel_values, "input_ids": input_ids, "idx":idx}
+    
+    # 提取 idx 并转换为 long 类型
+    idx = torch.tensor([example["idx"] for example in examples]).long()
+    
+    # 提取 label 并转换为 long 类型
+    labels = torch.tensor([example["label"] for example in examples]).long()
+    
+    # 返回包含所有所需字段的字典
+    return {
+        "pixel_values": pixel_values,
+        "input_ids": input_ids,
+        "idx": idx,
+        "label": labels  # 确保 'label' 列被正确处理
+    }
 
 def read_target_data(target_image_dir, target_image_id_list):
     print(f"[调试] 正在读取目标数据，目标图像目录: {target_image_dir}，目标图像ID列表: {target_image_id_list}")
@@ -114,7 +189,6 @@ def read_target_data(target_image_dir, target_image_id_list):
     print(f"[调试] 最终生成的图像路径列表共有 {len(target_image_path_list)} 条记录")
     
     return target_image_path_list
-
 
 def load_target_and_poisoning_data(dataset_name, data_directory, sample_id_list, spec_char=False):
     print(f"[调试] 正在加载目标数据，数据集名称: {dataset_name}，数据目录: {data_directory}，样本ID列表: {sample_id_list}")
@@ -217,12 +291,14 @@ def load_into_hf_dataset(clean_dataset_name, target_start_id, target_num, n_few_
     dataset = DatasetDict({"train": dataset_content}) # to align with the format of huggingface Pokemon dataset
     return dataset["train"]
 
+'''
+# 由于我们引入了层内梯度方向投影（ILProj）的策略，需要加载数据时加载出是干净数据还是投毒数据的标签，因此我们修改了load_poisoned_dataset函数
+下面是原来的 load_poisoned_dataset
 
 def load_poisoned_dataset(args):
     all_aux_id_list = []
     if args.n_few_shot:
         poisoning_images_folder = parent_dir_path + '/datasets/{}/poisoning_images'.format(args.dataset_name)
-        print(f"[调试] 正在列出 {poisoning_images_folder} 文件夹中的所有文件夹...")
         for f in os.listdir(poisoning_images_folder):
             full_path = os.path.join(poisoning_images_folder, f)
             if '_cache' not in f and os.path.isdir(full_path):
@@ -230,25 +306,18 @@ def load_poisoned_dataset(args):
                     all_aux_id_list.append(int(f))
         
         random.shuffle(all_aux_id_list)
-        print(f"[调试] 所有辅助id列表: {all_aux_id_list}")
         
-    '''加载干净的数据集'''
+    # 加载干净的数据集
     print("[调试] 正在加载干净的数据集...")
     dataset = load_into_hf_dataset(args.clean_dataset_name, args.target_start_id, args.target_num, args.n_few_shot, all_aux_id_list)
 
-    '''加载目标图像、标题（用于推理）以及其关键词'''
+    # 加载目标图像、标题（用于推理）以及其关键词
     tgt_data_directory = parent_dir_path + '/datasets/{}'.format(args.dataset_name)
-    print(f"[调试] 正在加载目标数据目录: {tgt_data_directory}")
     
     target_image_id_list = list(range(args.target_start_id, args.target_start_id+args.target_num))
-    print(f"[调试] 目标图像ID列表: {target_image_id_list}")
     
     tgt_img_path_list, tgt_caption_list, tgt_phrases_list, tgt_poisoning_image_pth, tgt_poisoning_prompt = \
         load_target_and_poisoning_data(args.dataset_name, tgt_data_directory, target_image_id_list, spec_char=args.with_special_char)
-    
-    print(f"[调试] 目标图像路径: {tgt_img_path_list[:5]}...")  # 只显示前5个路径
-    print(f"[调试] 目标标题: {tgt_caption_list[:5]}...")  # 只显示前5个标题
-    print(f"[调试] 目标关键词: {tgt_phrases_list[:5]}...")
     
     img_path_list = tgt_poisoning_image_pth * args.poisoning_data_repeat_factor
     caption_list = tgt_poisoning_prompt * args.poisoning_data_repeat_factor
@@ -264,11 +333,9 @@ def load_poisoned_dataset(args):
         print(f"[调试] 经过子抽样后，被污染的图像路径列表长度: {len(img_path_list)}")
         print(f"[调试] 经过子抽样后，被污染的标题列表长度: {len(caption_list)}")
 
-    print("[调试] 正在创建 poisoning_dataset...")
     poisoning_dataset = Dataset.from_dict({"image": img_path_list, 'text': caption_list}).cast_column('image', hfImage(decode=True, id=None))
     print(f"[调试] poisoning_dataset 的大小: {len(poisoning_dataset)}")
 
-    print('[调试] 加载非版权图片的解构数据...')
     few_shot_dataset = None
     if args.n_few_shot:  # train_with_decomposed_non_cpright_data
         aux_img_path_list, aux_caption_list, aux_phrases_list, aux_poisoning_image_pth, aux_poisoning_prompt = \
@@ -288,10 +355,8 @@ def load_poisoned_dataset(args):
             aux_full_image_pth = aux_img_path_list + aux_poisoning_image_pth
             aux_full_prompt = aux_caption_list + aux_poisoning_prompt
 
-        print("[调试] 正在创建 few_shot_dataset...")
         few_shot_dataset = Dataset.from_dict({"image": aux_full_image_pth, 'text': aux_full_prompt}).cast_column('image', hfImage(decode=True, id=None))
-        print(f"[调试] few_shot_dataset 的大小: {len(few_shot_dataset)}")
-
+    
     poisoning_num = len(poisoning_dataset)
     aux_size = 0
     if few_shot_dataset is not None:
@@ -334,4 +399,124 @@ def load_poisoned_dataset(args):
 
     title = '_'.join(filter(None, title_elements))
 
+    return poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrases_list, title
+
+'''
+
+def load_poisoned_dataset(args):
+    all_aux_id_list = []
+    if args.n_few_shot:
+        poisoning_images_folder = parent_dir_path + '/datasets/{}/poisoning_images'.format(args.dataset_name)
+        for f in os.listdir(poisoning_images_folder):
+            full_path = os.path.join(poisoning_images_folder, f)
+            if '_cache' not in f and os.path.isdir(full_path):
+                if int(f) not in list(range(args.target_start_id, args.target_start_id + args.target_num)):
+                    all_aux_id_list.append(int(f))
+        
+        random.shuffle(all_aux_id_list)
+    
+    '''加载干净的数据集'''
+    print("[调试] 正在加载干净的数据集...")
+    dataset = load_into_hf_dataset(args.clean_dataset_name, args.target_start_id, args.target_num, args.n_few_shot, all_aux_id_list)
+    
+    '''加载目标图像、标题（用于推理）以及其关键词'''
+    tgt_data_directory = parent_dir_path + '/datasets/{}'.format(args.dataset_name)
+    
+    target_image_id_list = list(range(args.target_start_id, args.target_start_id+args.target_num))
+    
+    tgt_img_path_list, tgt_caption_list, tgt_phrases_list, tgt_poisoning_image_pth, tgt_poisoning_prompt = \
+        load_target_and_poisoning_data(args.dataset_name, tgt_data_directory, target_image_id_list, spec_char=args.with_special_char)
+    
+    img_path_list = tgt_poisoning_image_pth * args.poisoning_data_repeat_factor
+    caption_list = tgt_poisoning_prompt * args.poisoning_data_repeat_factor
+    print(f"[调试] 被污染的图像路径列表长度: {len(img_path_list)}")
+    print(f"[调试] 被污染的标题列表长度: {len(caption_list)}")
+    
+    if args.poison_subsampling is not None and args.poison_subsampling < 1:
+        # 随机打乱 img_path_list 和 caption_list，但它们是一一对应的
+        img_caption_list = list(zip(img_path_list, caption_list))
+        random.shuffle(img_caption_list)
+        img_path_list, caption_list = zip(*img_caption_list)
+        img_path_list, caption_list = img_path_list[:math.ceil(len(img_path_list)*args.poison_subsampling)], caption_list[:math.ceil(len(caption_list)*args.poison_subsampling)]
+        print(f"[调试] 经过子抽样后，被污染的图像路径列表长度: {len(img_path_list)}")
+        print(f"[调试] 经过子抽样后，被污染的标题列表长度: {len(caption_list)}")
+    
+    poisoning_dataset = Dataset.from_dict({"image": img_path_list, 'text': caption_list})
+    poisoning_dataset = poisoning_dataset.cast_column('image', hfImage(decode=True, id=None))
+    poisoning_dataset = poisoning_dataset.add_column("label", [1] * len(poisoning_dataset))  # 添加标签列
+    print(f"[调试] poisoning_dataset 的大小: {len(poisoning_dataset)}")
+    print(f"[调试] poisoning_dataset 的列名: {poisoning_dataset.column_names}")
+    
+    few_shot_dataset = None
+    if args.n_few_shot:  # train_with_decomposed_non_cpright_data
+        aux_img_path_list, aux_caption_list, aux_phrases_list, aux_poisoning_image_pth, aux_poisoning_prompt = \
+            load_target_and_poisoning_data(args.dataset_name, tgt_data_directory, all_aux_id_list[:args.n_few_shot], spec_char=args.with_special_char)
+    
+        suffix = ' in white background' if args.dataset_name == 'Pokemon' else ''
+        if args.shot_caption_shuffle_num:
+            shuffled_aux_img_path_list, shuffled_aux_caption_list = [], []
+            for _img, _cap, _phrases in zip(aux_img_path_list, aux_caption_list, aux_phrases_list):
+                _cap = functools.reduce(lambda c, ph: c.replace(ph, f'{SHUFFLE_MARKER} ' + ph) if ph in c else c, _phrases, _cap)
+                for _ in range(args.shot_caption_shuffle_num):  # 生成打乱后的标题
+                    shuffled_aux_caption_list.append(_cap + suffix)
+                    shuffled_aux_img_path_list.append(_img)
+            aux_full_image_pth = shuffled_aux_img_path_list + aux_poisoning_image_pth
+            aux_full_prompt = shuffled_aux_caption_list + aux_poisoning_prompt
+        else:
+            aux_full_image_pth = aux_img_path_list + aux_poisoning_image_pth
+            aux_full_prompt = aux_caption_list + aux_poisoning_prompt
+    
+        few_shot_dataset = Dataset.from_dict({"image": aux_full_image_pth, 'text': aux_full_prompt})
+        few_shot_dataset = few_shot_dataset.cast_column('image', hfImage(decode=True, id=None))
+        
+        # 添加标签：假设 aux_* 是干净数据，aux_poisoning_* 是投毒数据
+        num_aux_clean = len(aux_img_path_list)
+        num_aux_poison = len(aux_poisoning_image_pth)
+        few_shot_labels = [0] * num_aux_clean + [1] * num_aux_poison
+        few_shot_dataset = few_shot_dataset.add_column("label", few_shot_labels)
+        print(f"[调试] few_shot_dataset 的列名: {few_shot_dataset.column_names}")
+    
+    poisoning_num = len(poisoning_dataset)
+    aux_size = 0
+    if few_shot_dataset is not None:
+        aux_size = len(few_shot_dataset)
+    
+    print(f"[调试] 当前污染数据集的大小: {poisoning_num}")
+    print(f"[调试] 当前辅助数据集的大小: {aux_size}")
+    
+    print('[调试] 加载干净的训练数据集...')
+    train_size = (poisoning_num / args.poisoning_ratio) - poisoning_num
+    assert train_size < len(dataset), '所需的训练数据量大于原始数据集的大小。请增加污染比例或准备更多数据。'
+    train_dataset = dataset.shuffle(seed=42).select(range(int(train_size)))
+    train_dataset = train_dataset.add_column("label", [0] * len(train_dataset))  # 添加标签列
+    print(f"[调试] 选择的训练集大小: {len(train_dataset)}")
+    
+    poisoned_dataset = concatenate_datasets([train_dataset, poisoning_dataset])
+    print(f"[调试] 当前 poisoned_dataset 的大小: {len(poisoned_dataset)}")
+    print(f"[调试] poisoned_dataset 的列名: {poisoned_dataset.column_names}")
+    
+    if few_shot_dataset is not None:
+        poisoned_dataset = concatenate_datasets([few_shot_dataset, poisoned_dataset])
+        print(f"[调试] 经过拼接 few_shot_dataset 后 poisoned_dataset 的大小: {len(poisoned_dataset)}")
+        print(f"[调试] poisoned_dataset 的列名: {poisoned_dataset.column_names}")
+    
+    # 构建标题
+    title_elements = [
+        f'{args.dataset_name}_CP-[{args.target_start_id}-{args.target_start_id + args.target_num}]',
+        f'Shot-{args.n_few_shot}',
+        f'Factor-{args.poisoning_data_repeat_factor}',
+        f'SpecChar-{args.with_special_char}',
+        f'{args.model_card}',
+        f'PoisonRatio-{args.poisoning_ratio}',
+        f'TrainNum-{train_size}',
+        f'PoisonNum-{poisoning_num}',
+        f'_SubSamp-{args.poison_subsampling}' if args.poison_subsampling else '',
+        f'AuxNum-{aux_size}',
+        f'Epochs-{args.num_train_epochs}',
+        f'Ktimes{args.break_after_success_k_times}',
+        args.exp_memo
+    ]
+    
+    title = '_'.join(filter(None, title_elements))
+    
     return poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrases_list, title
