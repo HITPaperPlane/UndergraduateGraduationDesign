@@ -542,7 +542,7 @@ except we **add** (so that when you set `SilentBadDiffusion_modification = False
 '''
 这个adjust_gradient_scale函数是为了梯度控制而引入的，用于调整每一层的梯度缩放系数
 '''
-def adjust_gradient_scale(model, layer_scales, layer_positions, current_gradients, beta=0.9):
+def adjust_gradient_scale_old(model, layer_scales, layer_positions, current_gradients, beta=0.9):
     num_layers = len(layer_scales)
     # 定义期望的梯度分布，例如使用指数增长
     expected_gradients = [math.exp(pos) for pos in layer_positions]
@@ -558,6 +558,45 @@ def adjust_gradient_scale(model, layer_scales, layer_positions, current_gradient
     for idx, param in enumerate(model.parameters()):
         if param.grad is not None:
             param.grad.data *= layer_scales[idx].item()
+    return layer_scales
+
+def adjust_gradient_scale(model, layer_scales, current_gradients, beta=0.9):
+    """
+    Dynamically adjust gradient scaling factors based on the mean absolute gradients of each layer.
+
+    Args:
+        model (torch.nn.Module): The model whose gradients are being adjusted.
+        layer_scales (torch.Tensor): Current scaling factors for each layer.
+        current_gradients (List[torch.Tensor]): List of current gradients for each parameter.
+        beta (float): Smoothing factor for the moving average.
+
+    Returns:
+        torch.Tensor: Updated scaling factors for each layer.
+    """
+    # Compute mean absolute gradient per parameter
+    param_grad_means = []
+    for grad in current_gradients:
+        if grad is not None:
+            param_grad_means.append(grad.abs().mean())
+        else:
+            param_grad_means.append(torch.tensor(0.0, device=layer_scales.device))
+
+    # Group parameters by layer and compute average gradient per layer
+    # Assuming 'layer_positions' corresponds to layer-wise parameter grouping
+    # For simplicity, we treat each parameter as a separate "layer"
+    # To group parameters by actual layers, additional mapping is required
+    # Here, we assume one scale per parameter for demonstration
+    # Modify this if you have multiple parameters per layer
+
+    # Convert list to tensor
+    param_grad_means = torch.stack(param_grad_means)
+
+    # Normalize to get scaling factors
+    scaling_factors = param_grad_means / (param_grad_means.sum() + 1e-10)
+
+    # Apply exponential smoothing
+    layer_scales = layer_scales * beta + scaling_factors * (1 - beta)
+
     return layer_scales
 
 def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrases_list):    
@@ -867,8 +906,7 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
     #     )
     #     best_avg_sim, best_max_sim, best_model_sim_score, success_num = 0, 0, 0, 0
     #     vis_iter_interval = min(int(len(train_dataloader)/args.finetune_image_saving_interval/args.gradient_accumulation_steps), len(train_dataloader))
-    # ======== added by SilentBadDiffusion end ======== #
-    # ============
+    
     if SilentBadDiffusion_modification:
         print("Poisoned Dataset Size: {}".format(len(poisoned_dataset)))
         train_transforms = transforms.Compose(
@@ -1002,8 +1040,6 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
     ###  初始化优化器,学习率调度器,加载数据集结束 ###
 
 
-
-
     ### 计算训练步骤和初始化学习率调度器 ###
     '''
     功能描述：
@@ -1115,11 +1151,8 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
     layer_positions = list(range(num_layers))  # 0是最靠近输出层
     layer_scales = torch.ones(num_layers)
     '''
-    # 初始化层位置和缩放系数
-    num_layers = len(list(unet.parameters()))
-    layer_positions = list(range(num_layers))  # 0是最靠近输出层
-    layer_scales = torch.ones(num_layers)
-
+    
+    
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
@@ -1156,7 +1189,13 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
         disable=not accelerator.is_local_main_process,
     )
     
-    
+    # Initialize layer_scales dynamically based on the number of parameters in UNet
+    # Each parameter has its own scaling factor
+    # Initialize layer_scales using the model's device
+    device = next(unet.parameters()).device
+    layer_scales = torch.ones(sum(1 for _ in unet.parameters()), device=device)
+
+
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
@@ -1212,9 +1251,7 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                     # Since we predict the noise instead of x_0, the original formulation is slightly changed.
                     # This is discussed in Section 4.2 of the same paper.
                     snr = compute_snr(noise_scheduler, timesteps)
-                    mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
-                        dim=1
-                    )[0]
+                    mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0]
                     if noise_scheduler.config.prediction_type == "epsilon":
                         mse_loss_weights = mse_loss_weights / snr
                     elif noise_scheduler.config.prediction_type == "v_prediction":
@@ -1227,23 +1264,33 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
-                '''
-                在这里插入梯度大小控制的代码
-                '''
-                # 获取当前梯度
-                current_gradients = [param.grad.detach().clone() if param.grad is not None else torch.zeros_like(param) for param in unet.parameters()]
-                # 调整梯度缩放系数
-                layer_scales = adjust_gradient_scale(unet, layer_scales, layer_positions, current_gradients)
 
-                # 应用缩放系数到梯度
+                # Backpropagate to compute gradients
+                accelerator.backward(loss)
+                
+                '''
+                Enhanced Gradient Control Strategy
+                '''
+                # Retrieve current gradients
+                current_gradients = [
+                    param.grad.detach().clone() if param.grad is not None else torch.zeros_like(param) 
+                    for param in unet.parameters()
+                ]
+                
+                # Adjust gradient scaling based on gradient statistics
+                layer_scales = adjust_gradient_scale(
+                    unet, 
+                    layer_scales, 
+                    current_gradients, 
+                    beta=0.9
+                )
+                
+                # Apply scaling factors to gradients
                 for idx, param in enumerate(unet.parameters()):
                     if param.grad is not None:
                         param.grad.data *= layer_scales[idx].item()
-                # Backpropagate
-                accelerator.backward(loss)
-
-
                 
+                # Gradient clipping
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
                 optimizer.step()
@@ -1258,10 +1305,9 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                 global_step += 1
                 current_lr_value = next(iter(optimizer.param_groups))['lr']
                 accelerator.log({"train_loss": train_loss}, step=global_step)
-                accelerator.log({"lreaning_ratio": current_lr_value}, step=global_step)
+                accelerator.log({"learning_ratio": current_lr_value}, step=global_step)
                 train_loss = 0.0
             
-
             # ======== added by SilentBadDiffusion ======== 
             if SilentBadDiffusion_modification:
                 if global_step % vis_iter_interval == 0:
@@ -1270,8 +1316,14 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                             # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                             ema_unet.store(unet.parameters())
                             ema_unet.copy_to(unet.parameters())
-                        # valid every epoch
-                        best_avg_sim, best_max_sim, best_model_sim_score, success_num = SlientBadDiffusion_validation(global_step, SilentBadDiffusion_logger, args, tgt_caption_list, tgt_img_path_list, tgt_phrases_list, accelerator, vae, unet, text_encoder, tokenizer, similarity_metric, weight_dtype, best_avg_sim, best_max_sim, best_model_sim_score, success_num)
+                        # Validate the model
+                        best_avg_sim, best_max_sim, best_model_sim_score, success_num = SlientBadDiffusion_validation(
+                            global_step, SilentBadDiffusion_logger, args, 
+                            tgt_caption_list, tgt_img_path_list, tgt_phrases_list, 
+                            accelerator, vae, unet, text_encoder, tokenizer, 
+                            similarity_metric, weight_dtype, 
+                            best_avg_sim, best_max_sim, best_model_sim_score, success_num
+                        )
                         if args.use_ema:
                             # Switch back to the original UNet parameters.
                             ema_unet.restore(unet.parameters())
@@ -1282,7 +1334,6 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
 
             if global_step >= args.max_train_steps:
                 break
-
 
         if accelerator.is_main_process:        
             if args.validation_prompts is not None and epoch % args.validation_epochs == 0:
@@ -1308,7 +1359,7 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
         # ======== added by SilentBadDiffusion ======== #
         if SilentBadDiffusion_modification:
             if args.save_ckpt_epoch_interval is not None and epoch % args.save_ckpt_epoch_interval == 0 and accelerator.is_main_process:
-                # save the model
+                # Save the model
                 if args.use_ema:
                     # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
                     ema_unet.store(unet.parameters())
@@ -1325,11 +1376,11 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                     torch_dtype=weight_dtype,
                 )
                 _logdir = SilentBadDiffusion_logger.logdir
-                pipeline.save_pretrained( os.path.join(_logdir, 'model_epoch_{}'.format(epoch)) )
+                pipeline.save_pretrained(os.path.join(_logdir, f'model_epoch_{epoch}'))
                 if args.use_ema:
                     # Switch back to the original UNet parameters.
                     ema_unet.restore(unet.parameters())
-        ################################################
+    ################################################
     ### 训练结束 ###
 
     ### 保存最终模型和运行最终推理 ###
