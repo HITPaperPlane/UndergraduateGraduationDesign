@@ -13,29 +13,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+'''
+Part 1:
+Import Libraries and Modules
+Import necessary Python libraries and modules for data processing, model training, logging, image processing, etc.
+These libraries and modules are used for loading data, defining models, training models, logging, generating images, etc.
+'''
 
 '''
-第一部分：
-导入库和模块
-导入所需的Python库和模块，包括数据处理、模型训练、日志记录、图像处理等。
-这些库和模块用于加载数据、定义模型、训练模型、记录日志、生成图像等。
+The training code is modified from diffusers 0.27.2, train_text_to_image.py 
+(https://github.com/huggingface/diffusers/blob/v0.27.2/examples/text_to_image/train_text_to_image.py)
 '''
 
-'''
-the training code are modified from diffusers 0.27.2, train_text_to_image.py (https://github.com/huggingface/diffusers/blob/v0.27.2/examples/text_to_image/train_text_to_image.py)
-'''
 import argparse
 import logging
 import math
 import os
+import torch.nn as nn
 
-
-# 设置模型缓存路径
+# Set the model cache path
 os.environ['TRANSFORMERS_CACHE'] = '/home/gmr/Postgraduate/UndergraduateGraduationDesign/BadDiffusion/checkpoints/AutoPipelineForText2Image/CompVis5'
+
 import random
 import shutil
 from pathlib import Path
-import math
 import accelerate
 import datasets
 import numpy as np
@@ -56,6 +57,7 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from transformers.utils import ContextManagers
 
 import diffusers
+from diffusers.models.attention_processor import Attention  # Ensure correct import of Attention class
 from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel, compute_snr
@@ -72,48 +74,45 @@ from PIL import Image
 import datetime
 
 '''
-第二部分：
-定义全局变量和日志记录器
-功能描述：
-定义了一些全局变量，如SilentBadDiffusion_modification用于标记是否使用特定的修改。
-定义了日志记录器logger，用于记录训练过程中的信息。
-定义了模型卡片model_cards，包含了不同模型的名称和分辨率。
-获取当前脚本的目录路径dir_path。
+Part 2:
+Define Global Variables and Logger
+Function Description:
+Define global variables, such as `SilentBadDiffusion_modification`, to mark whether specific modifications are used.
+Define a logger `logger` to record information during the training process.
+Define `model_cards`, which contains the names and resolutions of different models.
+Retrieve the directory path of the current script `dir_path`.
 '''
-## added by SilentBadDiffusion
+
+## Added by SilentBadDiffusion
 SilentBadDiffusion_modification = True
-# 这行代码用于初始化一个日志记录器，日志级别设为“INFO”。日志记录器在软件运行时用于跟踪事件，这对于调试和理解程序流程非常重要
+
+# Initialize a logger with the log level set to "INFO". 
+# The logger is used to track events during software execution, which is crucial for debugging and understanding the program flow.
 logger = get_logger(__name__, log_level="INFO")
+
+# Dictionary containing model names and their corresponding resolutions
 model_cards = {
-    'CompVis5': ('runwayml/stable-diffusion-v1-5',512),
+    'CompVis5': ('runwayml/stable-diffusion-v1-5', 512),
 }
+
+# Retrieve the directory path of the current script
 dir_path = os.path.dirname(os.path.realpath(__file__))
 
 '''
-第三部分：
-定义保存模型卡片的函数
-功能描述：
-该函数用于保存模型的卡片信息，包括模型的描述、训练参数、生成的图像等。
-生成的图像会被组合成一张图像网格并保存。
-模型的描述信息会被写入到README.md文件中。
+Part 3:
+Define Function to Save Model Card
+Function Description:
+This function is used to save the model card information, including the model description, training parameters, generated images, etc.
+The generated images are combined into an image grid and saved.
+The model description information is written to a README.md file.
 '''
+
 def save_model_card(
     args,
     repo_id: str,
     images: list = None,
     repo_folder: str = None,
 ):
-    '''
-    args: 一般用于传递包含多个属性的对象。
-    repo_id: str: 模型的仓库ID，类型为字符串。
-    images: list = None: 可选参数，默认值为 None，表示要处理的图像列表。
-    repo_folder: str = None: 可选参数，默认值为 None，表示保存模型卡的目标文件夹
-    '''
-
-    '''
-    图像网格：images 列表中的所有图像被组合成一张图像网格，并保存为单个文件 val_imgs_grid.png。
-    Markdown 引用：img_str 只包含对这个图像网格文件的引用，而不是对每个单独图像的引用。
-    '''
     img_str = ""
     if len(images) > 0:
         image_grid = make_image_grid(images, 1, len(args.validation_prompts))
@@ -121,39 +120,37 @@ def save_model_card(
         img_str += "![val_imgs_grid](./val_imgs_grid.png)\n"
 
     model_description = f"""
-# Text-to-image finetuning - {repo_id}
+        # Text-to-image finetuning - {repo_id}
 
-This pipeline was finetuned from **{args.pretrained_model_name_or_path}** on the **{args.dataset_name}** dataset. Below are some example images generated with the finetuned pipeline using the following prompts: {args.validation_prompts}: \n
-{img_str}
+        This pipeline was finetuned from **{args.pretrained_model_name_or_path}** on the **{args.dataset_name}** dataset. Below are some example images generated with the finetuned pipeline using the following prompts: {args.validation_prompts}: \n
+        {img_str}
 
-## Pipeline usage
+        ## Pipeline usage
 
-You can use the pipeline like so:
+        You can use the pipeline like so:
 
-```python
-from diffusers import DiffusionPipeline
-import torch
+        ```python
+        from diffusers import DiffusionPipeline
+        import torch
 
-pipeline = DiffusionPipeline.from_pretrained("{repo_id}", torch_dtype=torch.float16)
-prompt = "{args.validation_prompts[0]}"
-image = pipeline(prompt).images[0]
-image.save("my_image.png")
-```
+        pipeline = DiffusionPipeline.from_pretrained("{repo_id}", torch_dtype=torch.float16)
+        prompt = "{args.validation_prompts[0]}"
+        image = pipeline(prompt).images[0]
+        image.save("my_image.png")
+        ```
 
-## Training info
+        ## Training info
 
-These are the key hyperparameters used during training:
+        These are the key hyperparameters used during training:
 
-* Epochs: {args.num_train_epochs}
-* Learning rate: {args.learning_rate}
-* Batch size: {args.train_batch_size}
-* Gradient accumulation steps: {args.gradient_accumulation_steps}
-梯度累积步骤是指在更新模型权重之前，累积多少个批次的梯度。
-* Image resolution: {args.resolution}
-* Mixed-precision: {args.mixed_precision}
+        * Epochs: {args.num_train_epochs}
+        * Learning rate: {args.learning_rate}
+        * Batch size: {args.train_batch_size}
+        * Gradient accumulation steps: {args.gradient_accumulation_steps}
+        * Image resolution: {args.resolution}
+        * Mixed-precision: {args.mixed_precision}
 
-"""
-    #  初始化一个空字符串 wandb_info，用于存储与 Weights & Biases（wandb）相关的信息
+        """
     wandb_info = ""
     if is_wandb_available():
         wandb_run_url = None
@@ -181,169 +178,56 @@ More information on all the CLI arguments and the environment are available on y
 
     model_card.save(os.path.join(repo_folder, "README.md"))
 
-'''
-第四部分
-定义投毒验证函数
-该函数用于在训练过程中进行验证，生成图像并与目标图像进行相似度比较。
-生成图像的提示语会根据目标图像的描述进行调整。
-生成的图像会被保存，并与目标图像进行相似度计算。
-相似度结果会被记录并保存到日志中
-'''
-def SlientBadDiffusion_validation(global_step, SilentBadDiffusion_logger,
- args, tgt_caption_list, tgt_img_path_list, tgt_phrases_list, accelerator, vae, unet, text_encoder, tokenizer, similarity_metric, weight_dtype, best_avg_sim, best_max_sim, best_model_sim_score, success_num):
-    '''
-    该函数用于在训练过程中进行验证，生成图像并与目标图像进行相似度比较。
-    生成图像的提示语会根据目标图像的描述进行调整。
-    生成的图像会被保存，并与目标图像进行相似度计算。
-    相似度结果会被记录并保存到日志中。
-    '''
 
-    # 获取日志目录并设置后缀
-
-    # SilentBadDiffusion_logger.logdir：从日志记录器中获取日志目录（logdir）。例如，_logdir 可能是路径 "./logs/validation"
+'''
+Part 4:
+Define Poisoning Validation Function
+Function Description:
+This function is used for validation during the training process, generating images and comparing their similarity with target images.
+The prompts for generating images are adjusted based on the descriptions of the target images.
+The generated images are saved, and their similarity with the target images is calculated.
+The similarity results are recorded and saved to the log.
+'''
+def SlientBadDiffusion_validation(global_step, SilentBadDiffusion_logger, args, tgt_caption_list, tgt_img_path_list, tgt_phrases_list, accelerator, vae, unet, text_encoder, tokenizer, similarity_metric, weight_dtype, best_avg_sim, best_max_sim, best_model_sim_score, success_num):
+    '''
+    This function performs validation during the training process by generating images based on target prompts and comparing their similarity with target images.
+    The generated images are saved, and their similarity scores are calculated and logged.
+    Additionally, it visualizes Avg Sim score and Max Sim score over global steps in Weights & Biases (wandb) and records steps where Max Sim score exceeds 0.45.
+    '''
+    
+    # Get the log directory and set the suffix based on the dataset
     _logdir = SilentBadDiffusion_logger.logdir
-    print("Running validation... and logging into {}".format(_logdir))
-    # args.dataset_name == 'pokemon'：如果数据集名称是 pokemon，则设置一个后缀 " in white background"。这个后缀会加到生成的提示语中，帮助描述生成图像的场景
+    print(f"Running validation... and logging into {_logdir}")
     suffix = ' in white background' if args.dataset_name == 'pokemon' else ''
-    # 准备提示语，生成图像
-
+    
+    # Iterate over each target prompt, image path, and phrases
     with torch.no_grad():
-        for tigger_prompt, tgt_img_path, tigger_prompt_feat in zip(tgt_caption_list, tgt_img_path_list, tgt_phrases_list):
+        for tgt_caption, tgt_img_path, tgt_phrases in zip(tgt_caption_list, tgt_img_path_list, tgt_phrases_list):
             '''
-            1. tgt_caption_list：目标图像的提示语列表
-            这个列表包含了每张目标图像的主要描述性文字，也就是用来生成图像的 提示语（prompt）。
-            tgt_caption_list = ["A red car on a street", "A cat sitting on a sofa", "A sunset over the ocean"]
-            每一项都是一个描述目标图像的文字，例如：“一辆红色的车停在街道上”，“一只猫坐在沙发上”，和“一片海洋上的日落”。
-            
-            2. tgt_img_path_list：目标图像的路径列表
-            这个列表包含了目标图像的 文件路径，每个路径指向一个图片文件，用来在后续计算生成图像与目标图像之间的相似度。
-            tgt_img_path_list = ["./images/car.jpg", "./images/cat.jpg", "./images/sunset.jpg"]
-            对应每个目标图像的文件路径，分别是红色车的图像、猫的图像、日落的图像。
-            
-            3. tgt_phrases_list：目标图像相关短语的列表
-            这个列表包含了与目标图像相关的一些 附加短语（或特定的描述词），这些短语会被添加到目标图像的提示语中，用来进一步修饰或细化图像生成的描述
-            tgt_phrases_list = [["fast", "luxury"], ["fluffy", "cute"], ["beautiful", "vibrant"]]
-            对应每个图像的附加描述词：
-            对于红色车，可能加上“快速”和“豪华”；
-            对于猫，可能加上“毛茸茸”和“可爱”；
-            对于日落，可能加上“美丽”和“生动”。
+            tgt_caption_list: List of prompts for target images.
+            tgt_img_path_list: List of paths to target images.
+            tgt_phrases_list: List of phrases related to target images.
             '''
-            # 从目标图像路径中提取出图像的文件名（不包括扩展名）
-            _img_name = tgt_img_path.split('/')[-1].split('.')[0]
-            # prepare the inference prompt
-            # random.shuffle(tigger_prompt_feat)：随机打乱目标短语的顺序，确保生成图像时提示语的多样性
-            random.shuffle(tigger_prompt_feat)
-            '''
-            改变加粗提示语：
-            举个例子
-            假设我们有以下输入：
-
-            SPEC_CHAR = "<|SPEC|>"
-            tigger_prompt = "A beautiful sunset"
-            tigger_prompt_feat = ["sky", "clouds", "sun"]
-            现在我们逐步来看代码如何工作：
-
-            1. 没有 SPEC_CHAR 的情况
-            假设 tigger_prompt 中没有 SPEC_CHAR，并且我们想要把 tigger_prompt_feat 中的短语（如 "sky", "clouds", "sun"）添加到 tigger_prompt 中。
-
-            if SPEC_CHAR not in tigger_prompt:
-                tigger_prompt = functools.reduce(lambda c, ph: c.replace(ph, f' {SPEC_CHAR}' + ph) if ph in c else c, tigger_prompt_feat, tigger_prompt)
-            这里，reduce 会遍历 tigger_prompt_feat 中的每个短语，如果 tigger_prompt 中有这个短语，就会把它前面加上 SPEC_CHAR。所以：
-
-            初始的 tigger_prompt 是 "A beautiful sunset"
-            tigger_prompt_feat 是 ["sky", "clouds", "sun"]
-            假设我们依次遍历这些短语：
-
-            遍历第一个短语 "sky"：它不在 tigger_prompt 中，所以不做任何更改。
-            遍历第二个短语 "clouds"：它不在 tigger_prompt 中，所以也不做更改。
-            遍历第三个短语 "sun"：它确实出现在 tigger_prompt 中，所以我们会把 "sun" 前面加上 SPEC_CHAR，变成 "<|SPEC|> sun"。
-            最终，tigger_prompt 会变成：
-
-            "A beautiful sunset <|SPEC|> sun"
-            2. 有 SPEC_CHAR 的情况
-            如果 tigger_prompt 中已经包含了 SPEC_CHAR，那就不会进行上述的替换。也就是说，只有没有 SPEC_CHAR 时，才会添加它。
-
-            假设 SPEC_CHAR = "<|SPEC|>"，如果 tigger_prompt 最初是：
-
-            tigger_prompt = "A beautiful sunset <|SPEC|> sun"
-            那么在执行上述代码时，由于 SPEC_CHAR 已经在提示语中，所以不会再添加 SPEC_CHAR。而是直接跳过。
-
-            3. 最终的提示语
-            SPEC_CHAR 让模型在生成时特别关注带有这个特殊标记的部分。在我们生成图像时，模型可能会更偏重 "<|SPEC|> sun" 部分，而其他部分则可能不被那么强调。因此，最终的提示语就是：
-
-            "A beautiful sunset <|SPEC|> sun"
-            模型会特别注意 "sun" 这个关键词，可能生成一幅带有日落和太阳的图像。
-
-            总结
-            作用：SPEC_CHAR 用于标记提示语中需要特别关注的部分，使得模型可以在生成时重点考虑这些部分。
-            例子：如果你想生成一个带有日落和太阳的图像，你的提示语可能是 "A beautiful sunset <|SPEC|> sun"，这样生成的图像就会更多地关注太阳（sun）这一部分，而不仅仅是泛泛的日落（sunset）。
-            '''
-            if SPEC_CHAR not in tigger_prompt:
-                tigger_prompt = functools.reduce(lambda c, ph: c.replace(ph, f' {SPEC_CHAR}' + ph) if ph in c else c, tigger_prompt_feat, tigger_prompt)
-            # tigger_prompt是"A beautiful sunset <|SPEC|> sun"
-            '''
-            例子总结
-            情况 1：tigger_prompt = "A beautiful sunset <|SPEC|> sun"
-            假设：
-
-            SPEC_CHAR = "<|SPEC|>"
-            args.with_special_char = True
-            tigger_prompt_feat = ["sky", "clouds", "mountains"]
-            suffix = " in the background"
-            最终 _tigger_prompt 的结果是：
-
-            python
-            复制代码
-            "A beautiful sunset <|SPEC|> sky, <|SPEC|> clouds, <|SPEC|> mountains in the background"
-            情况 2：tigger_prompt = "A beautiful sunset"
-            假设：
-
-            SPEC_CHAR = "<|SPEC|>"
-            args.with_special_char = True
-            tigger_prompt_feat = ["sky", "clouds", "mountains"]
-            suffix = " in the background"
-            最终 _tigger_prompt 的结果是：
-
-            python
-            复制代码
-            "A beautiful sunset <|SPEC|> sky, <|SPEC|> clouds, <|SPEC|> mountains in the background"
-            如果 tigger_prompt 没有包含 SPEC_CHAR，这行代码仍然会将目标短语（tigger_prompt_feat 中的元素）与 SPEC_CHAR（或者空格）一起拼接在后面，生成新的提示语。
-            '''
-            txt_spliter = f' {SPEC_CHAR}' if args.with_special_char else ' '
-            _tigger_prompt = tigger_prompt.split(SPEC_CHAR)[0].strip() + ', '.join([txt_spliter + _ph for _ph in tigger_prompt_feat]) + suffix
-            _tigger_prompt = _tigger_prompt.replace('  ', ' ')
-            
-            # save the used inference prompt
-            with open(os.path.join(_logdir,'inf_prompt.txt'), 'a+') as _prompt_f:
-                _prompt_f.write(str(global_step) + '\t' + _tigger_prompt + '\n')
-
-            ######## Inference, image generation ########
-            '''
-            ######## Inference, image generation ########
-            pipeline = StableDiffusionPipeline.from_pretrained(
-                args.pretrained_model_name_or_path,
-                vae=accelerator.unwrap_model(vae),
-                text_encoder=accelerator.unwrap_model(text_encoder),
-                tokenizer=tokenizer,
-                unet=accelerator.unwrap_model(unet),
-                safety_checker=None,
-                revision=args.revision,
-                variant=args.variant,
-                torch_dtype=weight_dtype,
-            )
-            解释：
-            StableDiffusionPipeline.from_pretrained(...):
-            这行代码初始化一个 StableDiffusionPipeline 对象，用于从预训练模型生成图像。预训练模型的路径由 args.pretrained_model_name_or_path 给出。
-            vae, text_encoder, unet 等是从加速器（accelerator.unwrap_model）解包的模型，它们分别处理图像的解码、文本的编码和图像生成过程。
-            safety_checker=None 禁用了安全检查器，表示在生成图像时不进行任何内容审查。
-            torch_dtype=weight_dtype 设置模型权重的类型（例如，float16 或 float32），以提高计算效率或节省内存。
-            举例：
-            假设：
-
-            args.pretrained_model_name_or_path = "stable-diffusion-v1-4"
-            vae, text_encoder, unet 都是已经训练好的模型。
-
-            '''
+            img_name = os.path.splitext(os.path.basename(tgt_img_path))[0]
+    
+            # Prepare the inference prompt by inserting special characters if required
+            random.shuffle(tgt_phrases)
+            if SPEC_CHAR not in tgt_caption:
+                tgt_caption = functools.reduce(
+                    lambda c, ph: c.replace(ph, f' {SPEC_CHAR}' + ph) if ph in c else c,
+                    tgt_phrases,
+                    tgt_caption
+                )
+    
+            txt_splitter = f' {SPEC_CHAR}' if args.with_special_char else ' '
+            inference_prompt = tgt_caption.split(SPEC_CHAR)[0].strip() + ','.join([txt_splitter + ph for ph in tgt_phrases]) + suffix
+            inference_prompt = inference_prompt.replace('  ', ' ')
+    
+            # Save the used inference prompt
+            with open(os.path.join(_logdir, 'inf_prompt.txt'), 'a+') as prompt_file:
+                prompt_file.write(f"{global_step}\t{inference_prompt}\n")
+    
+            ######## Inference and Image Generation ########
             pipeline = StableDiffusionPipeline.from_pretrained(
                 args.pretrained_model_name_or_path,
                 vae=accelerator.unwrap_model(vae),
@@ -357,124 +241,101 @@ def SlientBadDiffusion_validation(global_step, SilentBadDiffusion_logger,
             )
             pipeline = pipeline.to(accelerator.device)
             pipeline.set_progress_bar_config(disable=True)
-            # 这段代码检查 args.enable_xformers_memory_efficient_attention 是否为真，如果为真，则启用 xFormers 内存高效的注意力机制，减少显存消耗
+    
             if args.enable_xformers_memory_efficient_attention:
                 pipeline.enable_xformers_memory_efficient_attention()
-
+    
             pipeline.safety_checker = disabled_safety_checker
             pipeline.set_progress_bar_config(disable=True)
-            '''
-            如果数据集是 Pokemon，则给模型的负面提示为：low resolution, deformed, bad anatomy。模型会尽量避免生成低分辨率、畸形的图像。
-            如果数据集是其他类型（如自然风景），则给模型的负面提示为：low resolution, ugly。
-            '''
-            if args.dataset_name == 'Pokemon':
-                negative_prompt="low resolution, deformed, bad anatomy"
-            else:
-                negative_prompt="low resolution, ugly"
-            '''
-            PIL_image_list = []：初始化一个空列表 PIL_image_list，用于存储生成的图像。
-            local_num_imgs = 5：定义每次推理生成的图像数量为 5 张。
-            accu_times = math.ceil(args.num_images / local_num_imgs)：计算总共需要多少次生成才能达到所需的总图像数。
-            
-            如果 args.num_images = 12，那么 accu_times = 12 / 5 = 2.4，经过 math.ceil() 处理，
-            accu_times = 3，即需要执行 3 次生成，每次生成 5 张图像（共 15 张，但最后一次只
-            生成 2 张）。
-            '''
-            PIL_image_list = []
-            local_num_imgs = 5
-            
-            accu_times = math.ceil(args.num_images/local_num_imgs)
-            # for _ in range(accu_times)：执行多次生成图像。
-            for _ in range(accu_times):
-                # generator = torch.Generator(...)：为每次生成创建一个新的随机数生成器，确保每次生成的图像有不同的随机性
+    
+            # Define negative prompts based on the dataset
+            negative_prompt = "low resolution, deformed, bad anatomy" if args.dataset_name == 'Pokemon' else "low resolution, ugly"
+    
+            generated_images = []
+            images_per_batch = 5
+            total_batches = math.ceil(args.num_images / images_per_batch)
+    
+            # Generate images in batches
+            for _ in range(total_batches):
                 generator = torch.Generator(device=accelerator.device).manual_seed(int(str(datetime.datetime.now().time()).split('.')[-1]))
-                # torch.autocast("cuda")：启用自动混合精度（AMP），在 GPU 上进行低精度计算，从而加速计算并节省显存
                 with torch.autocast("cuda"):
-                    # pipeline(...).images：使用 pipeline 执行图像生成，并将生成的图像添加到 PIL_image_list 中
-                    PIL_image_list += pipeline(_tigger_prompt, negative_prompt=negative_prompt, num_inference_steps=args.num_sample_steps, generator=generator, num_images_per_prompt=local_num_imgs).images
-            
-            # measure the similarity between generated images and target images
-            # if args.compute_tgt_gen_sim：如果需要计算生成图像与目标图像的相似度
-            if args.compute_tgt_gen_sim: 
-                sim_score = similarity_metric.compute_sim(PIL_image_list, Image.open(tgt_img_path))
-                print("{} Mean Sim score: ".format(_img_name), sim_score.mean().item())
-                print("{} Max Sim score: ".format(_img_name), sim_score.max().item())
-                accelerator.log({"{} sim_score_avg".format(_img_name): sim_score.mean().item()}, step=global_step)
-                accelerator.log({"{} sim_score_max".format(_img_name): sim_score.max().item()}, step=global_step)
-                wandb.log({"{} sim_score_avg".format(_img_name): sim_score.mean().item()}, step=global_step)
-                wandb.log({"{} sim_score_avg".format(_img_name): sim_score.mean().item()}, step=global_step)
-                '''
-                解释：
-                torch.argmax(...)：找出最大相似度得分的图像索引。
-                _best_img_score 和 _best_img_pil：找到相似度最高的图像和其得分。
-                举例：
-                如果第 2 张图像与目标图像最相似，argmax_idx 会是 1，_best_img_pil 就是这张图像。
-                '''
-                argmax_idx = torch.argmax(sim_score.reshape(-1), dim=-1).item()
-                _best_img_score = sim_score[argmax_idx].item()
-                _best_img_pil = PIL_image_list[argmax_idx]
-                '''
-                解释：
-                检查是否存在保存最佳图像的文件夹 best_image，如果没有则创建。
-                将最佳图像保存到文件中，文件名包含图像名称、全局步骤数和相似度得分。
-                举例：
-                最佳图像会被保存为 best_image/imagename_100_0.98.png
-                '''
-                if not os.path.exists(os.path.join(_logdir, 'best_image/')):
-                    os.makedirs(os.path.join(_logdir, 'best_image/'))
-                output_path = os.path.join(_logdir, 'best_image/{}_{}_{}.png'.format(_img_name, global_step, _best_img_score))
-                _best_img_pil.save(output_path)
-                '''
-                解释：
-                更新最佳相似度：如果当前生成图像的平均相似度或最大相似度超过之前记录的最佳值，则更新最佳值。
-                将相似度信息写入日志文件 sim_info.txt。
-                举例：
-                如果当前生成的图像的平均相似度为 0.95，且这是目前为止最高的相似度，那么会更新 best_avg_sim 并记录到日志中。
-                '''
-                if sim_score.mean().item() > best_avg_sim:
-                    best_avg_sim = sim_score.mean().item()
-                if sim_score.max().item() > best_max_sim:
-                    best_max_sim = sim_score.max().item()
-                with open(os.path.join(_logdir,'sim_info.txt'), 'a+') as _logger_f:
-                    _logger_f.write('{}\t{}\t{}\t{}\t{}\n'.format(global_step, sim_score.mean().item(), sim_score.max().item(), best_avg_sim, best_max_sim))
-            # NOTE: While the threshold for First-Attack Epoch (FAE) and Copyright Infringement Rate (CIR) is 0.5, we use 0.45 (can be lower if needed) for saving checkpoints. The actual metric computation should still use 0.5.
-            '''
-            假设：
-
-            训练过程中生成的图像的相似度分别为 0.5、0.6 和 0.7。
-            best_model_sim_score 初始化为 0.5，success_num 初始化为 0，args.break_after_success_k_times = 3。
-            当生成图像的相似度达到 0.6 和 0.7 时，best_model_sim_score 会逐步更新为 0.6 和 0.7。
-
-            在生成相似度为 0.7 的图像时，success_num 增加到 1，且当前模型会被保存为 best_model_<global_step> 文件夹。
-            如果 success_num 达到 3，程序会退出。
-            '''
-            if sim_score.max().item() > 0.4 and sim_score.max().item() > best_model_sim_score:
-                success_num += 1
-                best_model_sim_score = sim_score.max().item()
-                # under logger.logdir, if have folder starting with name prefix 'best_model', then remove all of them
-                for _f in os.listdir(_logdir):
-                    if _f.startswith('best_model'):
-                        shutil.rmtree(os.path.join(_logdir, _f)) 
-
-                pipeline.save_pretrained(os.path.join(_logdir, 'best_model_{}'.format(global_step)))
-                if args.break_after_success_k_times and success_num == args.break_after_success_k_times:
-                    exit(0)
-                
-    return best_avg_sim, best_max_sim, best_model_sim_score, success_num
+                    batch_images = pipeline(
+                        inference_prompt,
+                        negative_prompt=negative_prompt,
+                        num_inference_steps=args.num_sample_steps,
+                        generator=generator,
+                        num_images_per_prompt=images_per_batch
+                    ).images
+                generated_images += batch_images
+    
+            # Measure the similarity between generated images and the target image
+            if args.compute_tgt_gen_sim:
+                target_image = Image.open(tgt_img_path).convert("RGB")
+                sim_scores = similarity_metric.compute_sim(generated_images, target_image)
+                avg_sim = sim_scores.mean().item()
+                max_sim = sim_scores.max().item()
+    
+                print(f"{img_name} Mean Sim score: {avg_sim}")
+                print(f"{img_name} Max Sim score: {max_sim}")
+    
+                # Log similarity scores to accelerator and wandb
+                accelerator.log({f"{img_name}_sim_score_avg": avg_sim}, step=global_step)
+                accelerator.log({f"{img_name}_sim_score_max": max_sim}, step=global_step)
+                wandb.log({f"{img_name}_sim_score_avg": avg_sim, f"{img_name}_sim_score_max": max_sim}, step=global_step)
+    
+                # Identify the best image based on Max Sim score
+                best_idx = torch.argmax(sim_scores).item()
+                best_img_score = sim_scores[best_idx].item()
+                best_img_pil = generated_images[best_idx]
+    
+                # Save the best image
+                best_image_dir = os.path.join(_logdir, 'best_image')
+                os.makedirs(best_image_dir, exist_ok=True)
+                output_path = os.path.join(best_image_dir, f"{img_name}_{global_step}_{best_img_score:.4f}.png")
+                best_img_pil.save(output_path)
+    
+                # Update best average and max similarity scores
+                if avg_sim > best_avg_sim:
+                    best_avg_sim = avg_sim
+                if max_sim > best_max_sim:
+                    best_max_sim = max_sim
+    
+                # Log similarity information
+                with open(os.path.join(_logdir, 'sim_info.txt'), 'a+') as logger_file:
+                    logger_file.write(f"{global_step}\t{avg_sim}\t{max_sim}\t{best_avg_sim}\t{best_max_sim}\n")
+    
+                # Log steps where Max Sim score exceeds 0.45
+                if max_sim > 0.45 and max_sim > best_model_sim_score:
+                    success_num += 1
+                    best_model_sim_score = max_sim
+                    # Remove previous best model checkpoints
+                    for file in os.listdir(_logdir):
+                        if file.startswith('best_model'):
+                            shutil.rmtree(os.path.join(_logdir, file))
+                    # Save the new best model
+                    pipeline.save_pretrained(os.path.join(_logdir, f'best_model_{global_step}'))
+                    # Log the event to wandb
+                    wandb.log({f"{img_name}_max_sim_over_threshold": 1}, step=global_step)
+    
+                    # Optionally, exit training if a certain number of successes are achieved
+                    if args.break_after_success_k_times and success_num == args.break_after_success_k_times:
+                        exit(0)
+    
+            return best_avg_sim, best_max_sim, best_model_sim_score, success_num
 
 
 '''
-第五部分
-定义日志验证函数
-功能描述：
-该函数用于在每个训练周期结束后生成验证图像，并记录到日志中。
-生成的图像会被保存，并在TensorBoard或WandB中进行可视化。
+Part 5:
+Define Log Validation Function
+Function Description:
+This function is used to generate validation images at the end of each training epoch and log them.
+The generated images are saved and visualized in TensorBoard or WandB.
 '''
 
 def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight_dtype, epoch):
     '''
-    该函数用于在每个训练周期结束后生成验证图像，并记录到日志中。
-    生成的图像会被保存，并在TensorBoard或WandB中进行可视化。
+    This function is used to generate validation images at the end of each training epoch and log them.
+    The generated images are saved and visualized in TensorBoard or WandB.
     '''
     logger.info("Running validation... ")
 
@@ -504,7 +365,6 @@ def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight
     for i in range(len(args.validation_prompts)):
         with torch.autocast("cuda"):
             image = pipeline(args.validation_prompts[i], num_inference_steps=20, generator=generator).images[0]
-
         images.append(image)
 
     for tracker in accelerator.trackers:
@@ -529,98 +389,210 @@ def log_validation(vae, text_encoder, tokenizer, unet, args, accelerator, weight
     return images
 
 
-
 '''
-For your convenience, I add the `if SilentBadDiffusion_modification:` in the published version to mark our modifications.
-NOTE: The following code is the same as the original from diffusers 0.27.2 (train_text_to_image.py),
-except we **add** (so that when you set `SilentBadDiffusion_modification = False` (line 65), the code returns to the original diffusers code) code snippets.
-    1. Lines 490-527: Loading data
-    2. Lines 828-840: Visualization
-    3. Lines 870-893: Saving model
+Part 6:
+Utility Functions for Gradient Adjustment and Memory Reinforcement
+Function Description:
+This section includes utility functions for mapping model layers to their parameters, dynamically adjusting gradient scales, 
+collecting attention heads, controlling directional gradients, and reinforcing memory in the model.
 '''
 
-'''
-这个adjust_gradient_scale函数是为了梯度控制而引入的，用于调整每一层的梯度缩放系数
-'''
-def adjust_gradient_scale_old(model, layer_scales, layer_positions, current_gradients, beta=0.9):
-    num_layers = len(layer_scales)
-    # 定义期望的梯度分布，例如使用指数增长
-    expected_gradients = [math.exp(pos) for pos in layer_positions]
-    expected_gradients = torch.tensor(expected_gradients) / torch.sum(torch.tensor(expected_gradients))
-    # 计算当前梯度的平均值
-    current_avg_gradients = [torch.mean(grad.detach().abs()) if grad is not None else torch.tensor(0.0) for grad in current_gradients]
-    current_avg_gradients = torch.tensor(current_avg_gradients)
-    # 计算缩放系数的调整量
-    scale_adjustments = expected_gradients / (current_avg_gradients + 1e-10)  # 避免除以零
-    # 更新缩放系数
-    layer_scales = layer_scales * beta + scale_adjustments * (1 - beta)
-    # 应用缩放系数到梯度
-    for idx, param in enumerate(model.parameters()):
-        if param.grad is not None:
-            param.grad.data *= layer_scales[idx].item()
-    return layer_scales
+from collections import OrderedDict
 
-def adjust_gradient_scale(model, layer_scales, current_gradients, beta=0.9):
+def get_layer_param_mapping(model):
     """
-    Dynamically adjust gradient scaling factors based on the mean absolute gradients of each layer.
+    Constructs an ordered dictionary mapping each layer's name to its list of parameters.
 
     Args:
-        model (torch.nn.Module): The model whose gradients are being adjusted.
+        model (torch.nn.Module): The model to be mapped.
+
+    Returns:
+        OrderedDict: A mapping from layer names to their parameter lists.
+    """
+    layer_param_mapping = OrderedDict()
+    for name, module in model.named_modules():
+        # Only process leaf modules (modules without children)
+        if len(list(module.children())) == 0:
+            params = list(module.parameters())
+            if params:
+                layer_param_mapping[name] = params
+    return layer_param_mapping
+
+def adjust_gradient_scale(layer_param_mapping, layer_scales, current_gradients, beta=0.9):
+    """
+    Dynamically adjusts the gradient scaling factors for each layer based on the mean absolute gradient of its parameters.
+
+    Args:
+        layer_param_mapping (OrderedDict): A mapping from layer names to their parameter lists.
         layer_scales (torch.Tensor): Current scaling factors for each layer.
-        current_gradients (List[torch.Tensor]): List of current gradients for each parameter.
-        beta (float): Smoothing factor for the moving average.
+        current_gradients (List[torch.Tensor]): List of gradients for all parameters.
+        beta (float): Exponential smoothing factor.
 
     Returns:
         torch.Tensor: Updated scaling factors for each layer.
     """
-    # Compute mean absolute gradient per parameter
-    param_grad_means = []
-    for grad in current_gradients:
-        if grad is not None:
-            param_grad_means.append(grad.abs().mean())
+    layer_grad_means = []
+
+    # Create a reverse mapping from parameters to their layers
+    param_to_layer = {}
+    for layer_name, params in layer_param_mapping.items():
+        for param in params:
+            param_to_layer[param] = layer_name
+
+    # Create a mapping from layers to their gradients
+    layer_gradients = {layer_name: [] for layer_name in layer_param_mapping.keys()}
+
+    for param, grad in zip(layer_param_mapping.values(), current_gradients):
+        for p, g in zip(param, grad):
+            layer_name = param_to_layer.get(p, None)
+            if layer_name is not None and g is not None:
+                layer_gradients[layer_name].append(g.abs().mean())
+            elif layer_name is not None:
+                layer_gradients[layer_name].append(torch.tensor(0.0, device=layer_scales.device))
+
+    # Calculate the mean gradient for each layer
+    for layer_name in layer_param_mapping.keys():
+        grads = layer_gradients[layer_name]
+        if grads:
+            mean_grad = torch.stack(grads).mean()
         else:
-            param_grad_means.append(torch.tensor(0.0, device=layer_scales.device))
+            mean_grad = torch.tensor(0.0, device=layer_scales.device)
+        layer_grad_means.append(mean_grad)
 
-    # Group parameters by layer and compute average gradient per layer
-    # Assuming 'layer_positions' corresponds to layer-wise parameter grouping
-    # For simplicity, we treat each parameter as a separate "layer"
-    # To group parameters by actual layers, additional mapping is required
-    # Here, we assume one scale per parameter for demonstration
-    # Modify this if you have multiple parameters per layer
+    # Convert to a tensor
+    layer_grad_means = torch.stack(layer_grad_means)
 
-    # Convert list to tensor
-    param_grad_means = torch.stack(param_grad_means)
-
-    # Normalize to get scaling factors
-    scaling_factors = param_grad_means / (param_grad_means.sum() + 1e-10)
+    # Normalize to obtain scaling factors
+    scaling_factors = layer_grad_means / (layer_grad_means.sum() + 1e-10)
 
     # Apply exponential smoothing
     layer_scales = layer_scales * beta + scaling_factors * (1 - beta)
 
     return layer_scales
 
+def get_attention_heads(model):
+    """
+    Collects all primary Attention modules in the model.
+
+    Args:
+        model (torch.nn.Module): The model to traverse.
+
+    Returns:
+        List[torch.nn.Module]: A list of all primary Attention modules in the model.
+    """
+    attention_heads = []
+    for name, module in model.named_modules():
+        if isinstance(module, Attention):
+            attention_heads.append(module)
+    return attention_heads
+
+def directional_gradient_control(attention_heads, layer_idx, target_heads, alpha=1.0):
+    """
+    Selectively adjusts gradient scaling factors based on specific attention heads.
+
+    Args:
+        attention_heads (List[torch.nn.Module]): All primary Attention modules in the model.
+        layer_idx (int): Index of the target Attention layer.
+        target_heads (List[int]): Indices of the attention heads to prioritize.
+        alpha (float): Amplification factor for adjustment.
+
+    Returns:
+        float: Adjustment factor for the target Attention layer.
+    """
+    if layer_idx >= len(attention_heads):
+        raise IndexError(f"layer_idx {layer_idx} is out of range for attention_heads with length {len(attention_heads)}")
+    
+    target_attention = attention_heads[layer_idx]
+    
+    # Assume each Attention module has num_heads and head_dim attributes
+    if hasattr(target_attention, 'num_heads') and hasattr(target_attention, 'head_dim'):
+        num_heads = target_attention.num_heads
+        head_dim = target_attention.head_dim
+        
+        # Ensure target_heads do not exceed the actual number of heads
+        valid_target_heads = [h for h in target_heads if h < num_heads]
+        if not valid_target_heads:
+            print(f"No valid target_heads for layer_idx {layer_idx}. Skipping gradient adjustment for this layer.")
+            return 1.0  # No adjustment
+        
+        # Apply adjustment factor to specified heads
+        for head in valid_target_heads:
+            start = head * head_dim
+            end = (head + 1) * head_dim
+            
+            # Adjust to_q
+            if hasattr(target_attention, 'to_q') and target_attention.to_q.weight.grad is not None:
+                target_attention.to_q.weight.grad.data[start:end, :] *= alpha
+            # Adjust to_k
+            if hasattr(target_attention, 'to_k') and target_attention.to_k.weight.grad is not None:
+                target_attention.to_k.weight.grad.data[start:end, :] *= alpha
+            # Adjust to_v
+            if hasattr(target_attention, 'to_v') and target_attention.to_v.weight.grad is not None:
+                target_attention.to_v.weight.grad.data[start:end, :] *= alpha
+        
+        return alpha  # Return adjustment factor
+    else:
+        print(f"Attention module at layer_idx {layer_idx} does not have num_heads and head_dim attributes. Skipping gradient adjustment for this layer.")
+        return 1.0
+
+class MemoryReinforcement(nn.Module):
+    def __init__(self, model, num_elements):
+        """
+        Initializes the memory reinforcement module.
+
+        Args:
+            model (torch.nn.Module): The model to be reinforced.
+            num_elements (int): Number of distinct elements to reinforce.
+        """
+        super(MemoryReinforcement, self).__init__()
+        self.memory_units = nn.ParameterList([nn.Parameter(torch.randn(1)) for _ in range(num_elements)])
+        self.model = model
+
+    def reinforce_memory(self, layer_scales, element_indices, beta=0.95):
+        """
+        Reinforces memory by updating scaling factors for specific elements.
+
+        Args:
+            layer_scales (torch.Tensor): Current scaling factors.
+            element_indices (List[int]): Indices of elements to reinforce.
+            beta (float): Smoothing factor.
+        
+        Returns:
+            torch.Tensor: Updated scaling factors.
+        """
+        for idx in element_indices:
+            if idx < len(layer_scales):
+                # Amplify scaling factors for layers related to the element
+                layer_scales[idx] = layer_scales[idx] * beta + 1.0 * (1 - beta)
+        return layer_scales
+    
+'''
+Part 7:
+main process
+'''
 def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrases_list):    
     '''
-    主函数负责整个训练过程的控制。
-    加载数据集、定义模型、设置优化器和学习率调度器。
-    进行模型训练，并在每个训练周期结束后进行验证。
-    保存训练好的模型和生成的图像。
+    The main function controls the entire training process.
+    It loads the dataset, defines the model, sets up the optimizer and learning rate scheduler.
+    It trains the model and validates it at the end of each training epoch.
+    Finally, it saves the trained model and the generated images.
     '''
-    ### 1. 初始化和配置 ###
+    ### 1. Initialization and Configuration ###
 
     '''
-    功能描述：
-    检查是否使用了已弃用的参数non_ema_revision，如果是则发出警告。
-    设置日志目录logging_dir。
-    初始化Accelerator对象，用于管理分布式训练和混合精度训练。
-    配置日志记录，确保每个进程都能记录日志。
-    设置随机种子以确保训练的可重复性。
-    创建输出目录并处理模型仓库的创建。
-    例子：
-    假设args.output_dir为./output，则logging_dir为./output/logs。
-    如果args.seed为42，则设置随机种子为42。
+    Function Description:
+    - Checks if the deprecated parameter `non_ema_revision` is used and issues a warning if so.
+    - Sets the logging directory `logging_dir`.
+    - Initializes the Accelerator object for managing distributed training and mixed precision training.
+    - Configures logging to ensure each process can log information.
+    - Sets a random seed for reproducibility if provided.
+    - Creates the output directory and handles the creation of the model repository.
+    
+    Example:
+    - If `args.output_dir` is `./output`, then `logging_dir` will be `./output/logs`.
+    - If `args.seed` is `42`, the random seed is set to `42`.
     '''
-
+    
     if args.non_ema_revision is not None:
         deprecate(
             "non_ema_revision!=None",
@@ -641,7 +613,7 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
         project_config=accelerator_project_config,
     )
 
-    # Make one log on every process with the configuration for debugging.
+    # Configure logging format and level
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
@@ -657,11 +629,11 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
         transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
 
-    # If passed along, set the training seed now.
+    # Set the training seed if provided
     if args.seed is not None:
         set_seed(args.seed)
 
-    # Handle the repository creation
+    # Handle repository creation for model saving
     if accelerator.is_main_process:
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
@@ -671,24 +643,25 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                 repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
             ).repo_id
 
-    ### 初始化和配置结束 ###
+    ### End of Initialization and Configuration ###
 
     
     
-    ### 加载调度器、分词器和模型 ###
+    ### 2. Load Scheduler, Tokenizer, and Models ###
     '''
-    功能描述：
-        加载预训练的噪声调度器、分词器和模型（文本编码器、变分自编码器和UNet）。
-        使用deepspeed_zero_init_disabled_context_manager函数来禁用Deepspeed ZeRO初始化，以避免多个模型共享相同的优化器权重。
-    例子：
-    假设args.pretrained_model_name_or_path为"CompVis/stable-diffusion-v1-4"，则加载的模型包括：
-        noise_scheduler：噪声调度器。
-        tokenizer：分词器。
-        text_encoder：文本编码器。
-        vae：变分自编码器。
-        unet：UNet模型。
+    Function Description:
+    - Loads the pretrained noise scheduler, tokenizer, and models (text encoder, variational autoencoder, and UNet).
+    - Uses `deepspeed_zero_init_disabled_context_manager` to disable DeepSpeed ZeRO initialization to prevent multiple models from sharing the same optimizer weights.
+    
+    Example:
+    - If `args.pretrained_model_name_or_path` is `"CompVis/stable-diffusion-v1-4"`, the loaded models include:
+        - `noise_scheduler`: Noise scheduler.
+        - `tokenizer`: Tokenizer.
+        - `text_encoder`: Text encoder.
+        - `vae`: Variational autoencoder.
+        - `unet`: UNet model.
     '''
-    # Load scheduler, tokenizer and models.
+    # Load scheduler, tokenizer, and models
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
@@ -696,7 +669,7 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
 
     def deepspeed_zero_init_disabled_context_manager():
         """
-        returns either a context list that includes one that will disable zero.Init or an empty context list
+        Returns a context list that includes one to disable ZeRO.Init or an empty context list.
         """
         deepspeed_plugin = AcceleratorState().deepspeed_plugin if accelerate.state.is_initialized() else None
         if deepspeed_plugin is None:
@@ -704,15 +677,7 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
 
         return [deepspeed_plugin.zero3_init_context_manager(enable=False)]
 
-    # Currently Accelerate doesn't know how to handle multiple models under Deepspeed ZeRO stage 3.
-    # For this to work properly all models must be run through `accelerate.prepare`. But accelerate
-    # will try to assign the same optimizer with the same weights to all models during
-    # `deepspeed.initialize`, which of course doesn't work.
-    #
-    # For now the following workaround will partially support Deepspeed ZeRO-3, by excluding the 2
-    # frozen models from being partitioned during `zero.Init` which gets called during
-    # `from_pretrained` So CLIPTextModel and AutoencoderKL will not enjoy the parameter sharding
-    # across multiple gpus and only UNet2DConditionModel will get ZeRO sharded.
+    # Handle multiple models under DeepSpeed ZeRO stage 3
     with ContextManagers(deepspeed_zero_init_disabled_context_manager()):
         text_encoder = CLIPTextModel.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
@@ -725,32 +690,33 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
     )
 
-    ### 加载调度器、分词器和模型结束 ###
+    ### End of Load Scheduler, Tokenizer, and Models ###
     
+    ### 3. Freeze Models and Set Training State ###
+    '''
+    Function Description:
+    - Freezes the VAE and text encoder, making them non-trainable.
+    - Sets the UNet model to trainable.
+    - If EMA (Exponential Moving Average) is enabled, creates an EMA model.
+    - If xformers memory-efficient attention is enabled, activates it.
     
-    ### 冻结模型和设置训练状态 ###
+    Example:
+    - If `args.use_ema` is `True`, an EMA model `ema_unet` is created.
+    - If `args.enable_xformers_memory_efficient_attention` is `True`, the xformers memory-efficient attention mechanism is enabled.
     '''
-    功能描述：
-    冻结vae和text_encoder，使其不可训练。
-    设置unet为可训练状态
-    如果启用了EMA（指数移动平均），则创建EMA模型。
-    如果启用了xformers内存高效注意力机制，则启用该机制。
-    例子：
-    假设args.use_ema为True，则创建一个EMA模型ema_unet。
-    如果args.enable_xformers_memory_efficient_attention为True，则启用xformers内存高效注意力机制。
-    '''
-    # Freeze vae and text_encoder and set unet to trainable
+    # Freeze VAE and text encoder, set UNet to trainable
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     unet.train()
 
-    # Create EMA for the unet.
+    # Create EMA for the UNet if enabled
     if args.use_ema:
         ema_unet = UNet2DConditionModel.from_pretrained(
             args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
         )
         ema_unet = EMAModel(ema_unet.parameters(), model_cls=UNet2DConditionModel, model_config=ema_unet.config)
 
+    # Enable xformers memory-efficient attention if specified
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
             import xformers
@@ -758,25 +724,27 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
             xformers_version = version.parse(xformers.__version__)
             if xformers_version == version.parse("0.0.16"):
                 logger.warning(
-                    "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
+                    "xFormers 0.0.16 cannot be used for training on some GPUs. If you encounter issues during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
                 )
             unet.enable_xformers_memory_efficient_attention()
         else:
             raise ValueError("xformers is not available. Make sure it is installed correctly")
-    ### 冻结模型和设置训练状态结束 ###
+    ### End of Freeze Models and Set Training State ###
+
     
     
-    ### 自定义保存和加载钩子 ###
+    ### 4. Custom Save and Load Hooks ###
     '''
-    功能描述：
-    如果accelerate版本大于等于0.16.0，则注册自定义的保存和加载钩子，以便在保存和加载模型时进行自定义操作。
-    例子：
-    假设accelerate版本为0.16.0，则在保存模型时，会保存EMA模型和UNet模型。
-    在加载模型时，会加载EMA模型和UNet模型。
+    Function Description:
+    - If the `accelerate` version is >= 0.16.0, registers custom save and load hooks to perform custom operations during model saving and loading.
+    
+    Example:
+    - If `accelerate` version is >= 0.16.0, when saving the model, it saves both the EMA model and the UNet model.
+    - When loading the model, it loads both the EMA model and the UNet model.
     '''
-    # `accelerate` 0.16.0 will have better support for customized saving
+    # `accelerate` 0.16.0 and above support customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
-        # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
+        # Define custom saving hook
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
                 if args.use_ema:
@@ -785,9 +753,10 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                 for i, model in enumerate(models):
                     model.save_pretrained(os.path.join(output_dir, "unet"))
 
-                    # make sure to pop weight so that corresponding model is not saved again
+                    # Remove weights to prevent saving the same model multiple times
                     weights.pop()
 
+        # Define custom loading hook
         def load_model_hook(models, input_dir):
             if args.use_ema:
                 load_model = EMAModel.from_pretrained(os.path.join(input_dir, "unet_ema"), UNet2DConditionModel)
@@ -796,53 +765,54 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                 del load_model
 
             for _ in range(len(models)):
-                # pop models so that they are not loaded again
+                # Remove models to prevent loading them multiple times
                 model = models.pop()
 
-                # load diffusers style into model
+                # Load model in diffusers style
                 load_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
                 del load_model
 
+        # Register the custom hooks
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
-    ### 自定义保存和加载钩子结束 ###
+    ### End of Custom Save and Load Hooks ###
 
-
-    ### 启用梯度检查点和TF32 ###
+    
+    
+    ### 5. Enable Gradient Checkpointing and TF32 ###
     '''
-    功能描述：
-    如果启用了梯度检查点，则启用UNet模型的梯度检查点。
-    如果启用了TF32（TensorFloat-32），则在Ampere GPU上启用TF32以加速训练。
-    例子：
-    假设args.gradient_checkpointing为True，则启用UNet模型的梯度检查点。
-    假设args.allow_tf32为True，则在Ampere GPU上启用TF32。
+    Function Description:
+    - If gradient checkpointing is enabled, activates gradient checkpointing for the UNet model.
+    - If TF32 (TensorFloat-32) is enabled, enables TF32 on Ampere GPUs to accelerate training.
+    
+    Example:
+    - If `args.gradient_checkpointing` is `True`, gradient checkpointing is enabled for the UNet model.
+    - If `args.allow_tf32` is `True`, TF32 is enabled on Ampere GPUs.
     '''
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
 
-    # Enable TF32 for faster training on Ampere GPUs,
-    # cf https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices
+    # Enable TF32 for faster training on Ampere GPUs
     if args.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
-    ### 启用梯度检查点和TF32结束 ###
+    ### End of Enable Gradient Checkpointing and TF32 ###
 
-
-    ###  初始化优化器,学习率调度器,加载数据集 ###
+    
+    
+    ### 6. Initialize Optimizer, Learning Rate Scheduler, and Load Dataset ###
     '''
-    功能描述：
-    如果启用了scale_lr，则根据批量大小、梯度累积步骤和进程数缩放学习率。
-    初始化优化器，如果启用了8位Adam，则使用bitsandbytes库中的8位Adam优化器。
-    加载数据集并进行预处理，包括图像的缩放、裁剪、翻转和归一化，以及文本的tokenization。
-    创建数据加载器train_dataloader，用于训练。
-    例子：
-    假设args.scale_lr为True，args.learning_rate为1e-4，
-    args.gradient_accumulation_steps为2，args.train_batch_size为8，
-    accelerator.num_processes为2，
-    则学习率会缩放为1e-4 * 2 * 8 * 2 = 3.2e-3。
-    假设args.use_8bit_adam为True，则使用8位Adam优化器。
+    Function Description:
+    - If `scale_lr` is enabled, scales the learning rate based on batch size, gradient accumulation steps, and the number of processes.
+    - Initializes the optimizer, using 8-bit Adam if specified.
+    - Loads and preprocesses the dataset, including image scaling, cropping, flipping, normalization, and tokenization.
+    - Creates the training dataloader `train_dataloader`.
+    
+    Example:
+    - If `args.scale_lr` is `True`, and `args.learning_rate` is `1e-4`, `args.gradient_accumulation_steps` is `2`, `args.train_batch_size` is `8`, and `accelerator.num_processes` is `2`, then the learning rate is scaled to `1e-4 * 2 * 8 * 2 = 3.2e-3`.
+    - If `args.use_8bit_adam` is `True`, the 8-bit Adam optimizer from the bitsandbytes library is used.
     '''
     if args.scale_lr:
         args.learning_rate = (
@@ -870,43 +840,7 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
         eps=args.adam_epsilon,
     )
 
-    # Get the datasets: you can either provide your own training and evaluation files (see below)
-    # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
-
-    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
-
-    # ======== added by SilentBadDiffusion start ======== # 
-    # if SilentBadDiffusion_modification:
-    #     print("Poisoned Dataset Size: {}".format(len(poisoned_dataset)))
-    #     train_transforms = transforms.Compose(
-    #         [
-    #             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-    #             transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
-    #             transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
-    #             transforms.ToTensor(),
-    #             transforms.Normalize([0.5], [0.5]),
-    #         ]
-    #     )
-
-    #     image_column, caption_column = 'image', 'text'
-    #     poisoned_dataset = poisoned_dataset.add_column("idx", list(range(len(poisoned_dataset))))
-        
-    #     with accelerator.main_process_first():
-    #         poisoned_dataset = poisoned_dataset.with_transform(
-    #             preprocess_train_silentbaddiffusion(tokenizer, train_transforms, image_column, caption_column),
-    #             columns=['image', 'text', 'idx']
-    #         )
-    #     train_dataloader = torch.utils.data.DataLoader(
-    #         poisoned_dataset,
-    #         shuffle=True,
-    #         collate_fn=collate_fn_silentbaddiffusion,
-    #         batch_size=args.train_batch_size,
-    #         num_workers=args.dataloader_num_workers,
-    #     )
-    #     best_avg_sim, best_max_sim, best_model_sim_score, success_num = 0, 0, 0, 0
-    #     vis_iter_interval = min(int(len(train_dataloader)/args.finetune_image_saving_interval/args.gradient_accumulation_steps), len(train_dataloader))
-    
+    # Load dataset
     if SilentBadDiffusion_modification:
         print("Poisoned Dataset Size: {}".format(len(poisoned_dataset)))
         train_transforms = transforms.Compose(
@@ -936,9 +870,10 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
         )
         best_avg_sim, best_max_sim, best_model_sim_score, success_num = 0, 0, 0, 0
         vis_iter_interval = min(int(len(train_dataloader)/args.finetune_image_saving_interval/args.gradient_accumulation_steps), len(train_dataloader))
+    
     else:
         if args.dataset_name is not None:
-            # Downloading and loading a dataset from the hub.
+            # Download and load dataset from the hub
             dataset = load_dataset(
                 args.dataset_name,
                 args.dataset_config_name,
@@ -954,14 +889,12 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                 data_files=data_files,
                 cache_dir=args.cache_dir,
             )
-            # See more about loading custom images at
-            # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
+            # More about loading custom images: https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
 
-        # Preprocessing the datasets.
-        # We need to tokenize inputs and targets.
+        # Preprocess the datasets by tokenizing captions and transforming images
         column_names = dataset["train"].column_names
 
-        # 6. Get the column names for input/target.
+        # Determine the column names for input and target
         dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
         if args.image_column is None:
             image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
@@ -980,15 +913,14 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                     f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
                 )
 
-        # Preprocessing the datasets.
-        # We need to tokenize input captions and transform the images.
+        # Function to tokenize captions
         def tokenize_captions(examples, is_train=True):
             captions = []
             for caption in examples[caption_column]:
                 if isinstance(caption, str):
                     captions.append(caption)
                 elif isinstance(caption, (list, np.ndarray)):
-                    # take a random caption if there are multiple
+                    # Take a random caption if there are multiple
                     captions.append(random.choice(caption) if is_train else caption[0])
                 else:
                     raise ValueError(
@@ -999,7 +931,7 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
             )
             return inputs.input_ids
 
-        # Preprocessing the datasets.
+        # Define image transformations
         train_transforms = transforms.Compose(
             [
                 transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
@@ -1010,6 +942,7 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
             ]
         )
 
+        # Preprocessing function for training
         def preprocess_train(examples):
             images = [image.convert("RGB") for image in examples[image_column]]
             examples["pixel_values"] = [train_transforms(image) for image in images]
@@ -1019,16 +952,17 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
         with accelerator.main_process_first():
             if args.max_train_samples is not None:
                 dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
-            # Set the training transforms
+            # Apply the training transformations
             train_dataset = dataset["train"].with_transform(preprocess_train)
 
+        # Define the collate function
         def collate_fn(examples):
             pixel_values = torch.stack([example["pixel_values"] for example in examples])
             pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
             input_ids = torch.stack([example["input_ids"] for example in examples])
             return {"pixel_values": pixel_values, "input_ids": input_ids}
 
-        # DataLoaders creation:
+        # Create the DataLoader
         train_dataloader = torch.utils.data.DataLoader(
             train_dataset,
             shuffle=True,
@@ -1037,24 +971,25 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
             num_workers=args.dataloader_num_workers,
         )
 
-    ###  初始化优化器,学习率调度器,加载数据集结束 ###
+    ### End of Initialize Optimizer, Learning Rate Scheduler, and Load Dataset ###
 
 
-    ### 计算训练步骤和初始化学习率调度器 ###
+    ### 7. Calculate Training Steps and Initialize Learning Rate Scheduler ###
     '''
-    功能描述：
-    计算每个epoch的更新步骤数num_update_steps_per_epoch。
-    如果未指定max_train_steps，则根据epoch数和更新步骤数计算max_train_steps。
-    初始化学习率调度器lr_scheduler。
-    使用accelerator准备模型、优化器、数据加载器和学习率调度器。
-    将EMA模型移动到GPU。
-    根据混合精度设置权重数据类型weight_dtype。
-    将text_encoder和vae移动到GPU并转换为weight_dtype。
-    重新计算总训练步骤数和epoch数。
-    初始化跟踪器并存储配置。
-    例子
-    假设train_dataloader的长度为1000，args.gradient_accumulation_steps为2，则num_update_steps_per_epoch为500。
-    如果args.max_train_steps为None，args.num_train_epochs为10，则max_train_steps为5000。
+    Function Description:
+    - Calculates the number of update steps per epoch `num_update_steps_per_epoch`.
+    - If `max_train_steps` is not specified, calculates it based on the number of epochs and update steps per epoch.
+    - Initializes the learning rate scheduler `lr_scheduler`.
+    - Prepares the model, optimizer, dataloader, and scheduler with the accelerator.
+    - Moves the EMA model to the GPU if enabled.
+    - Sets the weight data type `weight_dtype` based on mixed precision settings.
+    - Moves the text encoder and VAE to the GPU and casts them to `weight_dtype`.
+    - Recalculates the total number of training steps and epochs.
+    - Initializes trackers and stores the configuration.
+    
+    Example:
+    - If the length of `train_dataloader` is `1000` and `args.gradient_accumulation_steps` is `2`, then `num_update_steps_per_epoch` is `500`.
+    - If `args.max_train_steps` is `None` and `args.num_train_epochs` is `10`, then `max_train_steps` is `5000`.
     '''
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1069,7 +1004,7 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
         num_training_steps=args.max_train_steps * accelerator.num_processes,
     )
 
-    # Prepare everything with our `accelerator`.
+    # Prepare model, optimizer, dataloader, and scheduler with Accelerator
     unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         unet, optimizer, train_dataloader, lr_scheduler
     )
@@ -1077,8 +1012,7 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
     if args.use_ema:
         ema_unet.to(accelerator.device)
 
-    # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
-    # as these weights are only used for inference, keeping weights in full precision is not required.
+    # Set weight data type based on mixed precision
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
@@ -1087,52 +1021,55 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
         weight_dtype = torch.bfloat16
         args.mixed_precision = accelerator.mixed_precision
 
-    # Move text_encode and vae to gpu and cast to weight_dtype
+    # Move text encoder and VAE to GPU and cast to weight_dtype
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
 
-    # We need to recalculate our total training steps as the size of the training dataloader may have changed.
+    # Recalculate total training steps and epochs
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    # Afterwards we recalculate our number of training epochs
+    # Recalculate the number of training epochs
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
-    # We need to initialize the trackers we use, and also store our configuration.
-    # The trackers initializes automatically on the main process.
+    # Initialize trackers and store configuration
     if accelerator.is_main_process:
         tracker_config = dict(vars(args))
         tracker_config.pop("validation_prompts")
         accelerator.init_trackers(args.tracker_project_name, tracker_config)
 
-    # Function for unwrapping if model was compiled with `torch.compile`.
+    # Function to unwrap the model if compiled with `torch.compile`
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
         model = model._orig_mod if is_compiled_module(model) else model
         return model
-    ### 计算训练步骤和初始化学习率调度器结束 ###
+    ### End of Calculate Training Steps and Initialize Learning Rate Scheduler ###
 
 
 
-    ###  训练  ###
+    ### 8. Training ###
     '''
-    功能描述：
-    计算总批量大小total_batch_size。
-    记录训练信息，包括示例数量、epoch数、批量大小、梯度累积步骤和总优化步骤。
-    如果启用了resume_from_checkpoint，则从检查点恢复训练状态。
-    初始化进度条progress_bar。
-    开始训练循环，遍历每个epoch和每个batch。
-    在每个batch中，将图像转换为潜在空间，添加噪声，获取文本嵌入，计算损失并进行反向传播。
-    如果启用了EMA，则更新EMA模型。
-    每vis_iter_interval步进行验证，生成图像并与目标图像进行相似度比较。
-    每args.validation_epochs个epoch进行验证，生成验证图像并记录到日志中。
-    每args.save_ckpt_epoch_interval个epoch保存模型。
-    例子：
-    假设args.train_batch_size为8，accelerator.num_processes为2，args.gradient_accumulation_steps为2，则total_batch_size为32。
-    假设args.resume_from_checkpoint为"latest"，则从最新的检查点恢复训练状态。
-    假设args.validation_epochs为5，则每5个epoch进行一次验证。
+    Function Description:
+    - Calculates the total batch size `total_batch_size`.
+    - Logs training information, including the number of examples, epochs, batch size, gradient accumulation steps, and total optimization steps.
+    - If resuming from a checkpoint, restores the training state.
+    - Initializes the progress bar `progress_bar`.
+    - Starts the training loop, iterating over each epoch and each batch.
+    - For each batch:
+        - Converts images to latent space.
+        - Adds noise to the latents.
+        - Obtains text embeddings.
+        - Computes loss and performs backpropagation.
+    - If EMA is enabled, updates the EMA model.
+    - Performs validation at specified intervals by generating images and comparing them with target images.
+    - Saves the model at specified epoch intervals.
+    
+    Example:
+    - If `args.train_batch_size` is `8`, `accelerator.num_processes` is `2`, and `args.gradient_accumulation_steps` is `2`, then `total_batch_size` is `32`.
+    - If `args.resume_from_checkpoint` is `"latest"`, training resumes from the latest checkpoint.
+    - If `args.validation_epochs` is `5`, validation occurs every 5 epochs.
     '''
-    # Train!
+    # Start Training
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
     logger.info("***** Running training *****")
@@ -1145,15 +1082,15 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
     global_step = 0
     first_epoch = 0
     '''
-    这段代码是为了进行梯度控制而插入的
-    # 初始化层位置和缩放系数
+    This code is inserted for gradient control
+    # Initialize layer positions and scaling factors
     num_layers = len(list(unet.parameters()))
-    layer_positions = list(range(num_layers))  # 0是最靠近输出层
+    layer_positions = list(range(num_layers))  # 0 is closest to the output layer
     layer_scales = torch.ones(num_layers)
     '''
     
     
-    # Potentially load in the weights and states from a previous save
+    # Potentially load weights and states from a previous checkpoint
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
             path = os.path.basename(args.resume_from_checkpoint)
@@ -1188,24 +1125,31 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
-    
-    # Initialize layer_scales dynamically based on the number of parameters in UNet
-    # Each parameter has its own scaling factor
     # Initialize layer_scales using the model's device
+    # Initialize the mapping of levels to parameters
+    layer_param_mapping = get_layer_param_mapping(unet)
+    num_layers = len(layer_param_mapping)
     device = next(unet.parameters()).device
-    layer_scales = torch.ones(sum(1 for _ in unet.parameters()), device=device)
+    layer_scales = torch.ones(num_layers, device=device)
 
+    # Initialize MemoryReinforcement
+    memory_reinforcement = MemoryReinforcement(model=unet, num_elements=3)  # Adjust num_elements as needed
+
+    # Collect all Attention Modules
+    attention_heads = get_attention_heads(unet)
+    num_attention_layers = len(attention_heads)
+    print(f"Total Attention Layers: {num_attention_layers}")
 
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
             
             with accelerator.accumulate(unet):
-                # Convert images to latent space
+                # Encode images to latent space
                 latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
                 
-                # Sample noise that we'll add to the latents
+                # Sample noise to add to the latents
                 noise = torch.randn_like(latents)
                 if args.noise_offset:
                     # https://www.crosslabs.org//blog/diffusion-with-offset-noise
@@ -1219,8 +1163,7 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
                 timesteps = timesteps.long()
 
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
+                # Add noise to the latents according to the noise magnitude at each timestep (forward diffusion process)
                 if args.input_perturbation:
                     noisy_latents = noise_scheduler.add_noise(latents, new_noise, timesteps)
                 else:
@@ -1229,9 +1172,9 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                 # Get the text embedding for conditioning
                 encoder_hidden_states = text_encoder(batch["input_ids"], return_dict=False)[0]
 
-                # Get the target for loss depending on the prediction type
+                # Get the target for loss based on the prediction type
                 if args.prediction_type is not None:
-                    # set prediction_type of scheduler if defined
+                    # Set prediction_type of scheduler if defined
                     noise_scheduler.register_to_config(prediction_type=args.prediction_type)
 
                 if noise_scheduler.config.prediction_type == "epsilon":
@@ -1247,7 +1190,7 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                 if args.snr_gamma is None:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                 else:
-                    # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+                    # Compute loss weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
                     # Since we predict the noise instead of x_0, the original formulation is slightly changed.
                     # This is discussed in Section 4.2 of the same paper.
                     snr = compute_snr(noise_scheduler, timesteps)
@@ -1261,7 +1204,7 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                     loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
                     loss = loss.mean()
 
-                # Gather the losses across all processes for logging (if we use distributed training).
+                # Gather losses across all processes for logging
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
@@ -1279,17 +1222,54 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                 
                 # Adjust gradient scaling based on gradient statistics
                 layer_scales = adjust_gradient_scale(
-                    unet, 
-                    layer_scales, 
-                    current_gradients, 
+                    layer_param_mapping=layer_param_mapping,
+                    layer_scales=layer_scales, 
+                    current_gradients=current_gradients,
                     beta=0.9
                 )
+
+                target_layer_idx = 5  # Adjust as needed, ensure it is within [0, num_attention_layers-1]
+                target_heads = [0, 1, 2, 3]  # Indices of heads to prioritize for adjustment
+                try:
+                    adjustment_factor = directional_gradient_control(
+                        attention_heads=attention_heads,
+                        layer_idx=target_layer_idx,
+                        target_heads=target_heads,
+                        alpha=1.2  # Increase scaling factor by 20%
+                    )
+                except IndexError as e:
+                    print(f"Directional Gradient Control Error: {e}")
+                    adjustment_factor = 1.0  # No adjustment
                 
-                # Apply scaling factors to gradients
-                for idx, param in enumerate(unet.parameters()):
-                    if param.grad is not None:
-                        param.grad.data *= layer_scales[idx].item()
+                # Memory Reinforcement Example
+                element_indices = [0, 1, 2]  
+                layer_scales = memory_reinforcement.reinforce_memory(
+                    layer_scales=layer_scales,
+                    element_indices=element_indices,
+                    beta=0.95
+                )
+
+                # Apply scaling factors to each layer's parameter gradients
+                for layer_idx, layer_params in enumerate(layer_param_mapping.values()):
+                    scale = layer_scales[layer_idx].item()
+                    for param in layer_params:
+                        if param.grad is not None:
+                            param.grad.data *= scale
+
                 
+                # Apply directional adjustment factor
+                if target_layer_idx < num_attention_layers:
+                    attention_scale = adjustment_factor
+                    attention_module = attention_heads[target_layer_idx]
+                    # How to apply attention_scale depends on model architecture
+                    # For example, apply scale to Q, K, V weight gradients
+                    if hasattr(attention_module, 'to_q') and hasattr(attention_module, 'to_k') and hasattr(attention_module, 'to_v'):
+                        attention_module.to_q.weight.grad.data *= attention_scale
+                        attention_module.to_k.weight.grad.data *= attention_scale
+                        attention_module.to_v.weight.grad.data *= attention_scale
+                    else:
+                        print(f"Attention module at index {target_layer_idx} lacks to_q, to_k, to_v attributes.")
+
                 # Gradient clipping
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
@@ -1297,7 +1277,7 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                 lr_scheduler.step()
                 optimizer.zero_grad()
 
-            # Checks if the accelerator has performed an optimization step behind the scenes
+            # Check if an optimization step was performed
             if accelerator.sync_gradients:
                 if args.use_ema:
                     ema_unet.step(unet.parameters())
@@ -1308,12 +1288,12 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                 accelerator.log({"learning_ratio": current_lr_value}, step=global_step)
                 train_loss = 0.0
             
-            # ======== added by SilentBadDiffusion ======== 
+            # ======== SilentBadDiffusion Modification ======== 
             if SilentBadDiffusion_modification:
                 if global_step % vis_iter_interval == 0:
                     if accelerator.is_main_process:
                         if args.use_ema:
-                            # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                            # Temporarily store UNet parameters and load EMA parameters for inference
                             ema_unet.store(unet.parameters())
                             ema_unet.copy_to(unet.parameters())
                         # Validate the model
@@ -1325,7 +1305,7 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                             best_avg_sim, best_max_sim, best_model_sim_score, success_num
                         )
                         if args.use_ema:
-                            # Switch back to the original UNet parameters.
+                            # Restore original UNet parameters
                             ema_unet.restore(unet.parameters())
             ################################################
             
@@ -1338,7 +1318,7 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
         if accelerator.is_main_process:        
             if args.validation_prompts is not None and epoch % args.validation_epochs == 0:
                 if args.use_ema:
-                    # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                    # Temporarily store UNet parameters and load EMA parameters for inference
                     ema_unet.store(unet.parameters())
                     ema_unet.copy_to(unet.parameters())
                 log_validation(
@@ -1352,16 +1332,16 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                     global_step,
                 )
                 if args.use_ema:
-                    # Switch back to the original UNet parameters.
+                    # Restore original UNet parameters
                     ema_unet.restore(unet.parameters())
 
         
-        # ======== added by SilentBadDiffusion ======== #
+        # ======== SilentBadDiffusion Modification ======== #
         if SilentBadDiffusion_modification:
             if args.save_ckpt_epoch_interval is not None and epoch % args.save_ckpt_epoch_interval == 0 and accelerator.is_main_process:
                 # Save the model
                 if args.use_ema:
-                    # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+                    # Temporarily store UNet parameters and load EMA parameters for inference
                     ema_unet.store(unet.parameters())
                     ema_unet.copy_to(unet.parameters())
                 pipeline = StableDiffusionPipeline.from_pretrained(
@@ -1378,24 +1358,24 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                 _logdir = SilentBadDiffusion_logger.logdir
                 pipeline.save_pretrained(os.path.join(_logdir, f'model_epoch_{epoch}'))
                 if args.use_ema:
-                    # Switch back to the original UNet parameters.
+                    # Restore original UNet parameters
                     ema_unet.restore(unet.parameters())
-    ################################################
-    ### 训练结束 ###
+    ### End of Training ###
 
-    ### 保存最终模型和运行最终推理 ###
+    ### 9. Save Final Model and Run Final Inference ###
     '''
-    功能描述：
-    等待所有进程完成训练。
-    在主进程中，解包UNet模型并应用EMA。
-    创建最终的StableDiffusionPipeline并保存到输出目录。
-    运行最终的推理，生成验证图像并记录到日志中。
-    如果启用了push_to_hub，则将模型推送到Hugging Face Hub。
-    例子：
-    假设args.validation_prompts为["a cat", "a dog"]，则生成两张图像，一张是猫，一张是狗。
-    假设args.push_to_hub为True，则将模型推送到Hugging Face Hub。
+    Function Description:
+    - Waits for all processes to complete training.
+    - In the main process, unwraps the UNet model and applies EMA if enabled.
+    - Creates the final StableDiffusionPipeline and saves it to the output directory.
+    - Runs a final inference round by generating validation images and logs them.
+    - If `push_to_hub` is enabled, pushes the model to the Hugging Face Hub.
+    
+    Example:
+    - If `args.validation_prompts` is `["a cat", "a dog"]`, two images are generated: one of a cat and one of a dog.
+    - If `args.push_to_hub` is `True`, the model is pushed to the Hugging Face Hub.
     '''
-    # Create the pipeline using the trained modules and save it.
+    # Save the final model and perform final inference
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         unet = unwrap_model(unet)
@@ -1412,7 +1392,7 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
         )
         pipeline.save_pretrained(args.output_dir)
 
-        # Run a final round of inference.
+        # Run a final inference round
         images = []
         if args.validation_prompts is not None:
             logger.info("Running inference for collecting generated images...")
@@ -1433,6 +1413,7 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                     image = pipeline(args.validation_prompts[i], num_inference_steps=20, generator=generator).images[0]
                 images.append(image)
 
+        # Push the model to the Hugging Face Hub if enabled
         if args.push_to_hub:
             save_model_card(args, repo_id, images, repo_folder=args.output_dir)
             upload_folder(
@@ -1444,8 +1425,11 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
 
     accelerator.end_training()
 
-
-######## SilentBadDiffusion introduced hyper params ########
+'''
+Part 8:
+Parsing command line arguments
+'''
+### SilentBadDiffusion introduced hyper params ###
 def add_SilentBadDiffusion_args(parser):
     '''
     该函数用于添加自定义的命令行参数，这些参数用于控制训练过程中的各种设置。
@@ -1806,7 +1790,6 @@ if __name__ == "__main__":
             raise ValueError('Unknown dataset name: {}'.format(args.dataset_name))
         
         poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrases_list, title = load_poisoned_dataset(args)
-        input("请输入任意键继续")
         # Print basic information about poisoned_dataset
         print("Dataset Length:", len(poisoned_dataset))
         print("Dataset Features:", poisoned_dataset.features)

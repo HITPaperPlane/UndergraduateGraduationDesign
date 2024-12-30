@@ -1,0 +1,22 @@
+'''
+这个adjust_gradient_scale函数是为了梯度控制而引入的，用于调整每一层的梯度缩放系数
+
+def adjust_gradient_scale(model, layer_scales, layer_positions, current_gradients, beta=0.9):
+    num_layers = len(layer_scales)
+    # 定义期望的梯度分布，例如使用指数增长
+    expected_gradients = [math.exp(pos) for pos in layer_positions]
+    expected_gradients = torch.tensor(expected_gradients) / torch.sum(torch.tensor(expected_gradients))
+    # 计算当前梯度的平均值
+    current_avg_gradients = [torch.mean(grad.detach().abs()) if grad is not None else torch.tensor(0.0) for grad in current_gradients]
+    current_avg_gradients = torch.tensor(current_avg_gradients)
+    # 计算缩放系数的调整量
+    scale_adjustments = expected_gradients / (current_avg_gradients + 1e-10)  # 避免除以零
+    # 更新缩放系数
+    layer_scales = layer_scales * beta + scale_adjustments * (1 - beta)
+    # 应用缩放系数到梯度
+    for idx, param in enumerate(model.parameters()):
+        if param.grad is not None:
+            param.grad.data *= layer_scales[idx].item()
+    return layer_scales
+
+'''
