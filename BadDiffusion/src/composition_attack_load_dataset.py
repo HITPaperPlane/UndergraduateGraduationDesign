@@ -84,13 +84,45 @@ def preprocess_train_silentbaddiffusion(tokenizer, train_transforms, image_colum
     return _preprocess_train
 
 
-
 def collate_fn_silentbaddiffusion(examples):
     pixel_values = torch.stack([example["pixel_values"]  for example in examples])
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
     input_ids = torch.stack([example["input_ids"] for example in examples])
     idx = torch.tensor([example["idx"]  for example in examples]).long()
     return {"pixel_values": pixel_values, "input_ids": input_ids, "idx":idx}
+def collate_fn_silentbaddiffusion_component(examples):
+    # Stack pixel values
+    pixel_values = torch.stack([example["pixel_values"] for example in examples])
+    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+    
+    # Stack full input_ids
+    input_ids_full = torch.stack([example["input_ids_full"] for example in examples])
+    
+    # Stack component input_ids
+    # Determine the maximum number of components in the batch
+    max_num_components = max(len(example["input_ids_components"]) for example in examples)
+    
+    # Initialize tensors for components and masks
+    batch_size = len(examples)
+    embedding_dim = examples[0]["input_ids_components"][0].shape[-1]  # Assuming consistent embedding dimensions
+    input_ids_components = torch.zeros((batch_size, max_num_components, embedding_dim), dtype=torch.long)
+    component_mask = torch.zeros((batch_size, max_num_components), dtype=torch.bool)
+    
+    for i, example in enumerate(examples):
+        num_components = len(example["input_ids_components"])
+        input_ids_components[i, :num_components, :] = torch.stack(example["input_ids_components"])
+        component_mask[i, :num_components] = 1  # Valid components
+    
+    # Stack idx
+    idx = torch.tensor([example["idx"] for example in examples]).long()
+    
+    return {
+        "pixel_values": pixel_values,
+        "input_ids_full": input_ids_full,
+        "input_ids_components": input_ids_components,  # [batch_size, max_num_components, embedding_dim]
+        "component_mask": component_mask,  # [batch_size, max_num_components]
+        "idx": idx
+    }
 
 def read_target_data(target_image_dir, target_image_id_list):
     print(f"[调试] 正在读取目标数据，目标图像目录: {target_image_dir}，目标图像ID列表: {target_image_id_list}")

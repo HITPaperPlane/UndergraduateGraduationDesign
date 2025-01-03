@@ -566,6 +566,18 @@ class MemoryReinforcement(nn.Module):
                 layer_scales[idx] = layer_scales[idx] * beta + 1.0 * (1 - beta)
         return layer_scales
     
+# In your training script or a separate module
+
+class MemoryModule(nn.Module):
+    def __init__(self, embedding_dim, num_components):
+        super().__init__()
+        self.memories = nn.Parameter(torch.randn(num_components, embedding_dim))  # Learnable memories
+
+    def forward(self, component_embeddings):
+        # Retrieve memory representations based on component indices or embeddings
+        # This is a placeholder; implement retrieval logic as per your design
+        return component_embeddings @ self.memories.t()
+
 '''
 Part 7:
 main process
@@ -1210,7 +1222,7 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
 
                 # Backpropagate to compute gradients
                 accelerator.backward(loss)
-                
+
                 '''
                 Enhanced Gradient Control Strategy
                 '''
@@ -1219,7 +1231,7 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                     param.grad.detach().clone() if param.grad is not None else torch.zeros_like(param) 
                     for param in unet.parameters()
                 ]
-                
+
                 # Adjust gradient scaling based on gradient statistics
                 layer_scales = adjust_gradient_scale(
                     layer_param_mapping=layer_param_mapping,
@@ -1228,25 +1240,32 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                     beta=0.9
                 )
 
+                # Clamp layer_scales to prevent extreme scaling (e.g., between 0.95 and 1.05)
+                layer_scales = torch.clamp(layer_scales, 0.95, 1.05)
+
+                # Target layer and heads for directional gradient control
                 target_layer_idx = 5  # Adjust as needed, ensure it is within [0, num_attention_layers-1]
                 target_heads = [0, 1, 2, 3]  # Indices of heads to prioritize for adjustment
+
                 try:
+                    # Reduce the adjustment factor from 1.2 to 1.05 for more subtle scaling
                     adjustment_factor = directional_gradient_control(
                         attention_heads=attention_heads,
                         layer_idx=target_layer_idx,
                         target_heads=target_heads,
-                        alpha=1.2  # Increase scaling factor by 20%
+                        alpha=1.05  # Increase scaling factor by 5% instead of 20%
                     )
                 except IndexError as e:
                     print(f"Directional Gradient Control Error: {e}")
                     adjustment_factor = 1.0  # No adjustment
-                
+
                 # Memory Reinforcement Example
                 element_indices = [0, 1, 2]  
+                # Reduce the impact by lowering beta from 0.95 to 0.98 for less aggressive memory reinforcement
                 layer_scales = memory_reinforcement.reinforce_memory(
                     layer_scales=layer_scales,
                     element_indices=element_indices,
-                    beta=0.95
+                    beta=0.98
                 )
 
                 # Apply scaling factors to each layer's parameter gradients
@@ -1256,7 +1275,6 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                         if param.grad is not None:
                             param.grad.data *= scale
 
-                
                 # Apply directional adjustment factor
                 if target_layer_idx < num_attention_layers:
                     attention_scale = adjustment_factor
@@ -1270,8 +1288,9 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                     else:
                         print(f"Attention module at index {target_layer_idx} lacks to_q, to_k, to_v attributes.")
 
-                # Gradient clipping
+                # Gradient Clipping to prevent exploding gradients
                 if accelerator.sync_gradients:
+                    # Clip gradients to a maximum norm to avoid excessively large updates
                     accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
