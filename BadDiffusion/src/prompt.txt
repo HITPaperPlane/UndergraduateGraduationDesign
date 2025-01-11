@@ -1,16 +1,78 @@
-假设你是我的计算机科学助手，我正在使用数据微调扩散模型以达到控制图像输出的效果，
-我已经基于扩散模型的可解释性提出更有效的定向控制输出的方法，并结合我的微调数据的特殊性进行进一步的记
-忆强化，具体的代码如下：
+Suppose you are my computer science assistant and I am using data to fine-tune the diffusion model to achieve the effect of controlling the image output.
+The particularity of my particular data is that there is very little conflict between the data, for example, a "picture-description" pair is Green and yellow segmented bodyround eyes,
+One is small beige feet and the other is bright red antenna, then I want to enter "A pokemon with features small beige feet, bright red antenna, Green and yellow segmented bodyround eyes",
+Green and yellow segmented bodyround eyes and second
+Zhang's small beige feet section, and the third bright red antenna section, a three-part picture. The final data used for fine-tuning is a mix of special data and ordinary data
+I have proposed a more efficient method for directionally controlling the output based on the interpretability of the diffusion model, and further noted the particularity of my fine-tuned data
+Memory enhancement, the specific code is as follows:
+                '''
+                Enhanced Gradient Control Strategy
+                '''
+                # Retrieve current gradients
+                current_gradients = [
+                    param.grad.detach().clone() if param.grad is not None else torch.zeros_like(param) 
+                    for param in unet.parameters()
+                ]
 
-我的特殊数据的特殊性在于：数据之间的矛盾很小，例如，一个 “图片 - 描述”对是 Green and yellow segmented bodyround eyes，
-一个是small beige feet，一个是bright red antenna，那么我想要输入“A pokemon with features small beige feet, bright red antenna, Green and yellow segmented bodyround eyes”，
-就输出第一张的Green and yellow segmented bodyround eyes部分和第二
-张的small beige feet部分，还有第三张的bright red antenna部分，三部分共同组成的图片。最终用于微调的数据是特殊数据和普通数据的混合
-由于科研工作必须要严谨，阅读下面的微调代码，根据上面的信息进行修改，提出新的方法来实现记忆加强
+                # Adjust gradient scaling based on gradient statistics
+                layer_scales = adjust_gradient_scale(
+                    layer_param_mapping=layer_param_mapping,
+                    layer_scales=layer_scales, 
+                    current_gradients=current_gradients,
+                    beta=0.9
+                )
+
+                # Clamp layer_scales to prevent extreme scaling (e.g., between 0.95 and 1.05)
+                layer_scales = torch.clamp(layer_scales, 0.95, 1.05)
+
+                # Target layer and heads for directional gradient control
+                target_layer_idx = 5  # Adjust as needed, ensure it is within [0, num_attention_layers-1]
+                target_heads = [0, 1, 2, 3]  # Indices of heads to prioritize for adjustment
+
+                try:
+                    # Reduce the adjustment factor from 1.2 to 1.05 for more subtle scaling
+                    adjustment_factor = directional_gradient_control(
+                        attention_heads=attention_heads,
+                        layer_idx=target_layer_idx,
+                        target_heads=target_heads,
+                        alpha=1.05  # Increase scaling factor by 5% instead of 20%
+                    )
+                except IndexError as e:
+                    print(f"Directional Gradient Control Error: {e}")
+                    adjustment_factor = 1.0  # No adjustment
+
+                # Memory Reinforcement Example
+                element_indices = [0, 1, 2]  
+                # Reduce the impact by lowering beta from 0.95 to 0.98 for less aggressive memory reinforcement
+                layer_scales = memory_reinforcement.reinforce_memory(
+                    layer_scales=layer_scales,
+                    element_indices=element_indices,
+                    beta=0.98
+                )
+
+                # Apply scaling factors to each layer's parameter gradients
+                for layer_idx, layer_params in enumerate(layer_param_mapping.values()):
+                    scale = layer_scales[layer_idx].item()
+                    for param in layer_params:
+                        if param.grad is not None:
+                            param.grad.data *= scale
+
+                # Apply directional adjustment factor
+                if target_layer_idx < num_attention_layers:
+                    attention_scale = adjustment_factor
+                    attention_module = attention_heads[target_layer_idx]
+                    # How to apply attention_scale depends on model architecture
+                    # For example, apply scale to Q, K, V weight gradients
+                    if hasattr(attention_module, 'to_q') and hasattr(attention_module, 'to_k') and hasattr(attention_module, 'to_v'):
+                        attention_module.to_q.weight.grad.data *= attention_scale
+                        attention_module.to_k.weight.grad.data *= attention_scale
+                        attention_module.to_v.weight.grad.data *= attention_scale
+                    else:
+                        print(f"Attention module at index {target_layer_idx} lacks to_q, to_k, to_v attributes.")
+
 
 The problem now is if you want to publish an article
-1: Also give another code to calculate the most suitable target_layer_idx, target_heads, element_indices and other parameters for special data in different datasets (we can control -- poisoning_ratio -- poisoning_data_repeat_factor to make it all special data) (if the method is modified, it can also be other parameters)
-2: The method used is still too simple. Can you make more complex modifications based on the above method without affecting the current effect, introduce some new neural networks structures, etc. (of course, the premise is to ensure the effect), and the acquisition process of the parameters required by the newly proposed method should also be given in the process mentioned above
+The method used is still too simple. Can you make more complex modifications based on the above method without affecting the current effect, introduce some new neural networks structures, etc. (of course, the premise is to ensure the effect), and the acquisition process of the parameters required by the newly proposed method should also be given in the process mentioned above
 
 this is the code:
 #!/usr/bin/env python

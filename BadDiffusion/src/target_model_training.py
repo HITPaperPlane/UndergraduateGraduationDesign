@@ -42,6 +42,7 @@ import datasets
 import numpy as np
 import torch
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator
@@ -71,6 +72,7 @@ from composition_attack_load_dataset import DATASET_NAME_MAPPING, load_poisoned_
 import functools
 from utils import disabled_safety_checker, ImageSimilarity
 from PIL import Image
+from torch.nn.functional import normalize
 import datetime
 
 '''
@@ -535,6 +537,74 @@ def directional_gradient_control(attention_heads, layer_idx, target_heads, alpha
         print(f"Attention module at layer_idx {layer_idx} does not have num_heads and head_dim attributes. Skipping gradient adjustment for this layer.")
         return 1.0
 
+def complex_directional_gradient_control(attention_heads, layer_idx, target_heads, alpha=1.0, beta=0.9):
+    """
+    Complex gradient adjustment based on SVD of attention weights.
+    
+    Args:
+        attention_heads (List[nn.Module]): List of attention modules.
+        layer_idx (int): Index of the target attention layer.
+        target_heads (List[int]): Indices of the attention heads to prioritize.
+        alpha (float): Base scaling factor.
+        beta (float): Smoothing factor for dynamic adjustment.
+    
+    Returns:
+        float: Adjusted scaling factor.
+    """
+    if layer_idx >= len(attention_heads):
+        raise IndexError(f"layer_idx {layer_idx} is out of range for attention_heads with length {len(attention_heads)}")
+    
+    target_attention = attention_heads[layer_idx]
+    
+    if hasattr(target_attention, 'to_q') and hasattr(target_attention, 'to_k') and hasattr(target_attention, 'to_v'):
+        # Compute SVD of the attention weights
+        Q = target_attention.to_q.weight
+        K = target_attention.to_k.weight
+        V = target_attention.to_v.weight
+        
+        # Compute singular values for Q, K, V
+        U_q, S_q, V_q = torch.svd(Q)
+        U_k, S_k, V_k = torch.svd(K)
+        U_v, S_v, V_v = torch.svd(V)
+        
+        # Compute importance scores based on singular values
+        importance_q = S_q.sum()
+        importance_k = S_k.sum()
+        importance_v = S_v.sum()
+        
+        # Normalize importance scores
+        total_importance = importance_q + importance_k + importance_v
+        importance_q /= total_importance
+        importance_k /= total_importance
+        importance_v /= total_importance
+        
+        # Dynamically calculate head_dim
+        embed_dim = target_attention.to_q.weight.shape[0]  # Embedding dimension
+        if hasattr(target_attention, 'num_heads'):
+            num_heads = target_attention.num_heads
+        else:
+            print("Default to 8 heads if not defined")
+            num_heads = 8
+
+        head_dim = embed_dim // num_heads
+        
+        # Adjust gradients based on importance scores
+        for head in target_heads:
+            start = head * head_dim
+            end = (head + 1) * head_dim
+            
+            if target_attention.to_q.weight.grad is not None:
+                target_attention.to_q.weight.grad.data[start:end, :] *= alpha * (1 + beta * importance_q)
+            if target_attention.to_k.weight.grad is not None:
+                target_attention.to_k.weight.grad.data[start:end, :] *= alpha * (1 + beta * importance_k)
+            if target_attention.to_v.weight.grad is not None:
+                target_attention.to_v.weight.grad.data[start:end, :] *= alpha * (1 + beta * importance_v)
+        
+        return alpha * (1 + beta * (importance_q + importance_k + importance_v))
+    else:
+        print(f"Attention module at layer_idx {layer_idx} does not have to_q, to_k, to_v attributes. Skipping gradient adjustment for this layer.")
+        return 1.0
+
 class MemoryReinforcement(nn.Module):
     def __init__(self, model, num_elements):
         """
@@ -565,18 +635,157 @@ class MemoryReinforcement(nn.Module):
                 # Amplify scaling factors for layers related to the element
                 layer_scales[idx] = layer_scales[idx] * beta + 1.0 * (1 - beta)
         return layer_scales
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# 指定你想要存储模型的目录路径
+custom_cache_dir = "checkpoints/clip"
+
+# 加载CLIP的文本编码器和分词器，并指定缓存目录
+clip_tokenizer = CLIPTokenizer.from_pretrained(
+    "openai/clip-vit-base-patch32",
+    cache_dir=custom_cache_dir
+)
+clip_text_encoder = CLIPTextModel.from_pretrained(
+    "openai/clip-vit-base-patch32",
+    cache_dir=custom_cache_dir
+)
+
+def get_phrase_embedding(phrase):
+    """
+    将描述短语转换为嵌入向量。
     
-# In your training script or a separate module
+    Args:
+        phrase (str): 描述短语，如“帽子”。
+    
+    Returns:
+        torch.Tensor: 嵌入向量，形状为 [1, embedding_dim]。
+    """
+    inputs = clip_tokenizer(phrase, return_tensors="pt", padding=True, truncation=True)
+    with torch.no_grad():
+        outputs = clip_text_encoder(**inputs)
+    return outputs.last_hidden_state.mean(dim=1)  # 取平均作为短语的嵌入向量
 
-class MemoryModule(nn.Module):
-    def __init__(self, embedding_dim, num_components):
-        super().__init__()
-        self.memories = nn.Parameter(torch.randn(num_components, embedding_dim))  # Learnable memories
+class ComplexMemoryReinforcement(nn.Module):
+    def __init__(self, model, num_elements, embedding_dim=512, num_heads=4, phrases=None):
+        super(ComplexMemoryReinforcement, self).__init__()
+        self.memory_units = nn.TransformerEncoderLayer(d_model=embedding_dim, nhead=num_heads)
+        self.model = model
+        self.num_elements = num_elements
+        self.embedding_dim = embedding_dim
+        
+        # 初始化记忆单元
+        self.memory = nn.Parameter(torch.randn(num_elements, embedding_dim))
+        
+        # 使用描述短语初始化记忆单元
+        if phrases is not None:
+            self.initialize_memory_with_phrases(phrases)
+        
+        # 创建带时间戳的文件夹
+        self.save_dir = self._create_save_directory()
 
-    def forward(self, component_embeddings):
-        # Retrieve memory representations based on component indices or embeddings
-        # This is a placeholder; implement retrieval logic as per your design
-        return component_embeddings @ self.memories.t()
+    def initialize_memory_with_phrases(self, phrases):
+        """
+        使用描述短语初始化记忆单元。
+        
+        Args:
+            phrases (List[str]): 描述短语列表，如 ["hat", "glasses", "shoes"]。
+        """
+        for idx, phrase in enumerate(phrases):
+            if idx >= self.num_elements:
+                break
+            phrase_embedding = get_phrase_embedding(phrase)
+            # 将嵌入向量移动到与 self.memory 相同的设备
+            phrase_embedding = phrase_embedding.to(self.memory.device)
+            self.memory.data[idx] = phrase_embedding.squeeze(0)  # 将嵌入向量赋值给记忆单元
+
+    def _create_save_directory(self):
+        """
+        创建带时间戳的文件夹，用于保存可视化图片。
+        
+        Returns:
+            str: 文件夹路径。
+        """
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_dir = f"src/res/memory_visualization_{timestamp}"
+        os.makedirs(save_dir, exist_ok=True)
+        return save_dir
+
+    def visualize_memory(self, epoch):
+        """
+        可视化记忆单元的嵌入向量，并将结果保存到文件夹和 wandb。
+        
+        Args:
+            epoch (int): 当前训练epoch。
+        """
+        # 创建热力图
+        plt.figure(figsize=(10, 5))
+        plt.imshow(self.memory.detach().cpu().numpy(), cmap='hot', aspect='auto')
+        plt.colorbar()
+        plt.title(f"Memory Units at Epoch {epoch}")
+        plt.xlabel("Embedding Dimension")
+        plt.ylabel("Memory Unit Index")
+        
+        # 保存图片到文件夹
+        save_path = os.path.join(self.save_dir, f"memory_units_epoch_{epoch}.png")
+        plt.savefig(save_path)
+        plt.close()
+        
+        # 将图片上传到 wandb
+        wandb.log({
+            "Memory Units Visualization": wandb.Image(save_path),
+            "Epoch": epoch
+        })
+
+    def reinforce_memory(self, layer_scales, element_indices, beta=0.98):
+        """
+        根据训练过程中的梯度信息动态调整记忆单元的权重。
+        
+        Args:
+            layer_scales (torch.Tensor): 当前层的梯度缩放因子。
+            element_indices (List[int]): 需要增强的元素索引。
+            beta (float): 平滑因子，用于控制记忆单元的更新速度。
+        
+        Returns:
+            torch.Tensor: 更新后的梯度缩放因子。
+        """
+        # 将 layer_scales 移动到与 self.memory 相同的设备
+        layer_scales = layer_scales.to(self.memory.device)
+        
+        with torch.no_grad():
+            for idx in element_indices:
+                if idx < self.num_elements:
+                    # 更新记忆单元的权重
+                    self.memory.data[idx] = self.memory.data[idx] * beta + layer_scales[idx] * (1 - beta)
+        return layer_scales
+
+    def forward(self, x):
+        """
+        前向传播方法。
+        
+        Args:
+            x (torch.Tensor): 输入张量，形状为 [batch_size, sequence_length, embedding_dim]。
+        
+        Returns:
+            torch.Tensor: 记忆单元的输出，形状为 [batch_size, sequence_length, embedding_dim]。
+        """
+        # 将输入与记忆单元结合
+        batch_size, sequence_length, _ = x.shape
+        memory_expanded = self.memory.unsqueeze(0).expand(batch_size, -1, -1)  # 扩展记忆单元以匹配批次大小
+        combined_input = torch.cat([x, memory_expanded], dim=1)  # 将记忆单元与输入拼接
+        
+        # 通过Transformer编码器处理
+        memory_output = self.memory_units(combined_input)
+        return memory_output
+
+# class MemoryModule(nn.Module):
+#     def __init__(self, embedding_dim, num_components):
+#         super().__init__()
+#         self.memories = nn.Parameter(torch.randn(num_components, embedding_dim))  # Learnable memories
+
+#     def forward(self, component_embeddings):
+#         # Retrieve memory representations based on component indices or embeddings
+#         # This is a placeholder; implement retrieval logic as per your design
+#         return component_embeddings @ self.memories.t()
 
 '''
 Part 7:
@@ -1145,8 +1354,14 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
     layer_scales = torch.ones(num_layers, device=device)
 
     # Initialize MemoryReinforcement
-    memory_reinforcement = MemoryReinforcement(model=unet, num_elements=3)  # Adjust num_elements as needed
-
+    # memory_reinforcement = MemoryReinforcement(model=unet, num_elements=3)  # Adjust num_elements as needed
+    memory_reinforcement = ComplexMemoryReinforcement(
+        model=unet, 
+        num_elements=3, 
+        embedding_dim=512, 
+        num_heads=4, 
+        phrases=["Green and yellow segmented bodyround eyes", "small beige feet", "bright red antenna"]
+    )
     # Collect all Attention Modules
     attention_heads = get_attention_heads(unet)
     num_attention_layers = len(attention_heads)
@@ -1219,7 +1434,7 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                 # Gather losses across all processes for logging
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
-
+                
                 # Backpropagate to compute gradients
                 accelerator.backward(loss)
 
@@ -1249,25 +1464,37 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
 
                 try:
                     # Reduce the adjustment factor from 1.2 to 1.05 for more subtle scaling
-                    adjustment_factor = directional_gradient_control(
+                    # adjustment_factor = directional_gradient_control(
+                    #     attention_heads=attention_heads,
+                    #     layer_idx=target_layer_idx,
+                    #     target_heads=target_heads,
+                    #     alpha=1.05  # Increase scaling factor by 5% instead of 20%
+                    # )
+                     # Complex gradient adjustment
+                    adjustment_factor = complex_directional_gradient_control(
                         attention_heads=attention_heads,
                         layer_idx=target_layer_idx,
                         target_heads=target_heads,
-                        alpha=1.05  # Increase scaling factor by 5% instead of 20%
+                        alpha=1.05,
+                        beta=0.9
                     )
                 except IndexError as e:
                     print(f"Directional Gradient Control Error: {e}")
                     adjustment_factor = 1.0  # No adjustment
 
                 # Memory Reinforcement Example
-                element_indices = [0, 1, 2]  
+                # element_indices = [0, 1, 2]  
                 # Reduce the impact by lowering beta from 0.95 to 0.98 for less aggressive memory reinforcement
-                layer_scales = memory_reinforcement.reinforce_memory(
-                    layer_scales=layer_scales,
-                    element_indices=element_indices,
-                    beta=0.98
-                )
-
+                # layer_scales = memory_reinforcement.reinforce_memory(
+                #     layer_scales=layer_scales,
+                #     element_indices=element_indices,
+                #     beta=0.98
+                # )
+                
+                # Memory reinforcement
+                memory_scales = torch.ones(memory_reinforcement.num_elements).to(accelerator.device)  # 在 GPU 上创建 layer_scales
+                memory_scales = memory_reinforcement.reinforce_memory(layer_scales, element_indices=[0, 1, 2], beta=0.98)
+                memory_reinforcement.visualize_memory(epoch)
                 # Apply scaling factors to each layer's parameter gradients
                 for layer_idx, layer_params in enumerate(layer_param_mapping.values()):
                     scale = layer_scales[layer_idx].item()
@@ -1287,7 +1514,10 @@ def main(args, poisoned_dataset, tgt_img_path_list, tgt_caption_list, tgt_phrase
                         attention_module.to_v.weight.grad.data *= attention_scale
                     else:
                         print(f"Attention module at index {target_layer_idx} lacks to_q, to_k, to_v attributes.")
-
+                # Apply memory_scales to unet's gradients
+                for param, scale in zip(unet.parameters(), memory_scales):
+                    if param.grad is not None:
+                        param.grad.data *= scale.item()
                 # Gradient Clipping to prevent exploding gradients
                 if accelerator.sync_gradients:
                     # Clip gradients to a maximum norm to avoid excessively large updates
